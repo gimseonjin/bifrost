@@ -3,6 +3,7 @@ package tracing
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -259,6 +260,61 @@ func TestGenerateSpanID_Format(t *testing.T) {
 	if !isHex(id) {
 		t.Errorf("generateSpanID() = %q, not valid hex", id)
 	}
+}
+
+// TestGeneratedIDsKeepTheirFormat pins the ID shapes the batched source must keep: 32 and 16
+// lowercase hex characters, the version 4 nibble where a v4 UUID puts it, and the RFC 4122 variant
+// in a trace ID.
+func TestGeneratedIDsKeepTheirFormat(t *testing.T) {
+	traceRe := regexp.MustCompile(`^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
+	spanRe := regexp.MustCompile(`^[0-9a-f]{12}4[0-9a-f]{3}$`)
+	for range 2000 {
+		if id := generateTraceID(); !traceRe.MatchString(id) {
+			t.Fatalf("trace ID %q does not have the version 4 UUID shape", id)
+		}
+		if id := generateSpanID(); !spanRe.MatchString(id) {
+			t.Fatalf("span ID %q does not have the shape of a version 4 UUID's first 64 bits", id)
+		}
+	}
+}
+
+// TestGeneratedIDsAreUniqueUnderConcurrency draws IDs from many goroutines across several refills
+// of every shard and checks no byte range was handed out twice.
+func TestGeneratedIDsAreUniqueUnderConcurrency(t *testing.T) {
+	const workers, perWorker = 16, 5000
+	var mu sync.Mutex
+	seen := make(map[string]struct{}, workers*perWorker*2)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			local := make([]string, 0, perWorker*2)
+			for range perWorker {
+				local = append(local, generateSpanID(), generateTraceID())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, id := range local {
+				if _, dup := seen[id]; dup {
+					t.Errorf("ID %q handed out twice", id)
+					return
+				}
+				seen[id] = struct{}{}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// BenchmarkGenerateSpanID measures one span ID under concurrent callers, the request-path shape.
+func BenchmarkGenerateSpanID(b *testing.B) {
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = generateSpanID()
+		}
+	})
 }
 
 func TestSetTraceAttribute(t *testing.T) {
