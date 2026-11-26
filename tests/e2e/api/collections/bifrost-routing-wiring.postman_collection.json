@@ -31832,6 +31832,855 @@
       ]
     },
     {
+      "name": "Classifier model routers with the same classifier settings classify a request once",
+      "description": "Two classifier routers take this run's own model, classify with the same settings and have no targets, so each passes the request to the next router; a conditional router after them sends it to B. The second router reuses the first one's answer: the trail holds one classification, whether it produced a tier or not, and each router's own line.",
+      "item": [
+        {
+          "id": "rt-router-same-classifier-settings-01-add-provider",
+          "name": "01. add provider [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var acceptable = [200,201];",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "pm.test(\"01. add provider [router-same-classifier-settings]\", function () {",
+                  "  pm.expect(acceptable, 'status ' + pm.response.code + ' body ' + pm.response.text()).to.include(pm.response.code);",
+                  "});",
+                  "if (acceptable.indexOf(pm.response.code) < 0) { pm.execution.setNextRequest(cleanupReq); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/providers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "providers"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"provider\":\"catwiring-rt-router-same-classifier-settings-{{run_id}}\",\"custom_provider_config\":{\"base_provider_type\":\"openai\",\"is_key_less\":false}}"
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-02-add-key",
+          "name": "02. add key ka [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var acceptable = [200,201];",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "pm.test(\"02. add key ka [router-same-classifier-settings]\", function () {",
+                  "  pm.expect(acceptable, 'status ' + pm.response.code + ' body ' + pm.response.text()).to.include(pm.response.code);",
+                  "});",
+                  "if (acceptable.indexOf(pm.response.code) < 0) { pm.execution.setNextRequest(cleanupReq); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/providers/catwiring-rt-router-same-classifier-settings-{{run_id}}/keys",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "providers",
+                "catwiring-rt-router-same-classifier-settings-{{run_id}}",
+                "keys"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"id\":\"ka-{{run_id}}\",\"name\":\"catwiring-rt-router-same-classifier-settings-ka-{{run_id}}\",\"models\":[\"catwiring-mr06-{{run_id}}\",\"gpt-4o-mini\"],\"enabled\":true,\"value\":\"env.OPENAI_API_KEY\",\"aliases\":{\"catwiring-mr06-{{run_id}}\":\"gpt-4o-mini\"}}"
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-03-add-provider",
+          "name": "03. add provider (b) [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var acceptable = [200,201];",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "pm.test(\"03. add provider (b) [router-same-classifier-settings]\", function () {",
+                  "  pm.expect(acceptable, 'status ' + pm.response.code + ' body ' + pm.response.text()).to.include(pm.response.code);",
+                  "});",
+                  "if (acceptable.indexOf(pm.response.code) < 0) { pm.execution.setNextRequest(cleanupReq); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/providers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "providers"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"provider\":\"catwiring-rt-router-same-classifier-settings-b-{{run_id}}\",\"custom_provider_config\":{\"base_provider_type\":\"openai\",\"is_key_less\":false}}"
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-04-add-key",
+          "name": "04. add key kb (b) [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var acceptable = [200,201];",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "pm.test(\"04. add key kb (b) [router-same-classifier-settings]\", function () {",
+                  "  pm.expect(acceptable, 'status ' + pm.response.code + ' body ' + pm.response.text()).to.include(pm.response.code);",
+                  "});",
+                  "if (acceptable.indexOf(pm.response.code) < 0) { pm.execution.setNextRequest(cleanupReq); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/providers/catwiring-rt-router-same-classifier-settings-b-{{run_id}}/keys",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "providers",
+                "catwiring-rt-router-same-classifier-settings-b-{{run_id}}",
+                "keys"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"id\":\"kb-{{run_id}}\",\"name\":\"catwiring-rt-router-same-classifier-settings-kb-{{run_id}}\",\"models\":[\"catwiring-mr06-{{run_id}}\"],\"enabled\":true,\"value\":\"env.OPENAI_API_KEY\",\"aliases\":{\"catwiring-mr06-{{run_id}}\":\"gpt-4o-mini\"}}"
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-05-create-router",
+          "name": "05. create a classifier router with no targets and empty_target next_router [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var acceptable = [200,201];",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "pm.test(\"05. create a classifier router with no targets and empty_target next_router [router-same-classifier-settings]\", function () {",
+                  "  pm.expect(acceptable, 'status ' + pm.response.code + ' body ' + pm.response.text()).to.include(pm.response.code);",
+                  "});",
+                  "if (acceptable.indexOf(pm.response.code) < 0) { pm.execution.setNextRequest(cleanupReq); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/routing/model-routers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "routing",
+                "model-routers"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"id\":\"catwiring-rtr-router-same-classifier-settings-r1-{{run_id}}\",\"name\":\"catwiring-rtr-router-same-classifier-settings-r1-{{run_id}}\",\"mode\":\"classifier\",\"classifier\":\"llm\",\"llm\":{\"provider\":\"catwiring-rt-router-same-classifier-settings-{{run_id}}\",\"model\":\"gpt-4o-mini\"},\"keywords\":{\"simple_keywords\":[\"what time is it\"],\"medium_keywords\":[\"summarise this paragraph\"],\"complex_keywords\":[\"design a distributed cache\"]},\"routing\":{\"enabled\":true,\"scope\":\"global\",\"cel_expression\":\"model == 'catwiring-mr06-{{run_id}}'\",\"priority\":0,\"empty_target\":\"next_router\"}}"
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-06-create-router",
+          "name": "06. create a second classifier router with the same classifier settings [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var acceptable = [200,201];",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "pm.test(\"06. create a second classifier router with the same classifier settings [router-same-classifier-settings]\", function () {",
+                  "  pm.expect(acceptable, 'status ' + pm.response.code + ' body ' + pm.response.text()).to.include(pm.response.code);",
+                  "});",
+                  "if (acceptable.indexOf(pm.response.code) < 0) { pm.execution.setNextRequest(cleanupReq); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/routing/model-routers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "routing",
+                "model-routers"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"id\":\"catwiring-rtr-router-same-classifier-settings-r2-{{run_id}}\",\"name\":\"catwiring-rtr-router-same-classifier-settings-r2-{{run_id}}\",\"mode\":\"classifier\",\"classifier\":\"llm\",\"llm\":{\"provider\":\"catwiring-rt-router-same-classifier-settings-{{run_id}}\",\"model\":\"gpt-4o-mini\"},\"keywords\":{\"simple_keywords\":[\"what time is it\"],\"medium_keywords\":[\"summarise this paragraph\"],\"complex_keywords\":[\"design a distributed cache\"]},\"routing\":{\"enabled\":true,\"scope\":\"global\",\"cel_expression\":\"model == 'catwiring-mr06-{{run_id}}'\",\"priority\":1,\"empty_target\":\"next_router\"}}"
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-07-create-router",
+          "name": "07. create a conditional router after them: this run's model goes to B [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var acceptable = [200,201];",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "pm.test(\"07. create a conditional router after them: this run's model goes to B [router-same-classifier-settings]\", function () {",
+                  "  pm.expect(acceptable, 'status ' + pm.response.code + ' body ' + pm.response.text()).to.include(pm.response.code);",
+                  "});",
+                  "if (acceptable.indexOf(pm.response.code) < 0) { pm.execution.setNextRequest(cleanupReq); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/routing/model-routers",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "routing",
+                "model-routers"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"id\":\"catwiring-rtr-router-same-classifier-settings-r3-{{run_id}}\",\"name\":\"catwiring-rtr-router-same-classifier-settings-r3-{{run_id}}\",\"mode\":\"conditional\",\"routing\":{\"enabled\":true,\"scope\":\"global\",\"cel_expression\":\"model == 'catwiring-mr06-{{run_id}}'\",\"priority\":2}}"
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-08-router-targets",
+          "name": "08. set the targets of router r3 [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var acceptable = [200];",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "pm.test(\"08. set the targets of router r3 [router-same-classifier-settings]\", function () {",
+                  "  pm.expect(acceptable, 'status ' + pm.response.code + ' body ' + pm.response.text()).to.include(pm.response.code);",
+                  "});",
+                  "if (acceptable.indexOf(pm.response.code) < 0) { pm.execution.setNextRequest(cleanupReq); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/routing/model-routers/catwiring-rtr-router-same-classifier-settings-r3-{{run_id}}/targets",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "routing",
+                "model-routers",
+                "catwiring-rtr-router-same-classifier-settings-r3-{{run_id}}",
+                "targets"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"targets\":[{\"provider\":\"catwiring-rt-router-same-classifier-settings-b-{{run_id}}\",\"model\":\"catwiring-mr06-{{run_id}}\",\"weight\":1}]}"
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-09-await-catalog",
+          "name": "09. wait for the catalog to list the provider's models [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var pollKey = '__poll_' + pm.info.requestName;",
+                  "var attempt = parseInt(pm.collectionVariables.get(pollKey) || '0', 10);",
+                  "pm.collectionVariables.set('__cur_poll_key', pollKey);",
+                  "pm.collectionVariables.set('__cur_poll_attempt', String(attempt));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var maxAttempts = 8;",
+                  "var pollKey = '__poll_' + pm.info.requestName;",
+                  "var attempt = parseInt(pm.collectionVariables.get(pollKey) || '0', 10);",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "function assertNow() {",
+                  "  var providerName = 'catwiring-rt-router-same-classifier-settings-' + pm.variables.get('run_id');",
+                  "  var expected = [\"catwiring-mr06-{{run_id}}\",\"gpt-4o-mini\"].map(function (m) { return pm.variables.replaceIn(m); });",
+                  "  if (pm.response.code !== 200) { throw new Error('list models status ' + pm.response.code); }",
+                  "  var names = ((pm.response.json() || {}).models || []).filter(function (m) { return m.provider === providerName; })",
+                  "    .map(function (m) { return m.name; });",
+                  "  if (names.length === 0) { throw new Error('the catalog lists no models for ' + providerName + ' yet'); }",
+                  "  expected.forEach(function (m) {",
+                  "    if (names.indexOf(m) < 0) { throw new Error('the catalog does not list ' + m + ' for ' + providerName + ' yet: ' + JSON.stringify(names.slice(0, 20))); }",
+                  "  });",
+                  "}",
+                  "var ok = true, errMsg = '';",
+                  "try { assertNow(); } catch (e) { ok = false; errMsg = e.message; }",
+                  "if (ok) {",
+                  "  pm.collectionVariables.set(pollKey, '0');",
+                  "  pm.test(\"09. wait for the catalog to list the provider's models [router-same-classifier-settings]\", function () { pm.expect(true, 'assertion satisfied').to.be.true; });",
+                  "} else if (attempt < maxAttempts) {",
+                  "  pm.collectionVariables.set(pollKey, String(attempt + 1));",
+                  "  var sleepMs = Math.min(250 * Math.pow(2, attempt), 4000);",
+                  "  var start = Date.now(); while (Date.now() - start < sleepMs) {}",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set(pollKey, '0');",
+                  "  pm.test(\"09. wait for the catalog to list the provider's models [router-same-classifier-settings]\", function () { throw new Error('gave up after ' + (maxAttempts + 1) + ' attempts: ' + errMsg); });",
+                  "  pm.execution.setNextRequest(cleanupReq);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/models?provider=catwiring-rt-router-same-classifier-settings-{{run_id}}&limit=1000",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "models"
+              ],
+              "query": [
+                {
+                  "key": "provider",
+                  "value": "catwiring-rt-router-same-classifier-settings-{{run_id}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "1000"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-10-await-catalog",
+          "name": "10. wait for the catalog to list b's models [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var pollKey = '__poll_' + pm.info.requestName;",
+                  "var attempt = parseInt(pm.collectionVariables.get(pollKey) || '0', 10);",
+                  "pm.collectionVariables.set('__cur_poll_key', pollKey);",
+                  "pm.collectionVariables.set('__cur_poll_attempt', String(attempt));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var maxAttempts = 8;",
+                  "var pollKey = '__poll_' + pm.info.requestName;",
+                  "var attempt = parseInt(pm.collectionVariables.get(pollKey) || '0', 10);",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "function assertNow() {",
+                  "  var providerName = 'catwiring-rt-router-same-classifier-settings-b-' + pm.variables.get('run_id');",
+                  "  var expected = [\"catwiring-mr06-{{run_id}}\"].map(function (m) { return pm.variables.replaceIn(m); });",
+                  "  if (pm.response.code !== 200) { throw new Error('list models status ' + pm.response.code); }",
+                  "  var names = ((pm.response.json() || {}).models || []).filter(function (m) { return m.provider === providerName; })",
+                  "    .map(function (m) { return m.name; });",
+                  "  if (names.length === 0) { throw new Error('the catalog lists no models for ' + providerName + ' yet'); }",
+                  "  expected.forEach(function (m) {",
+                  "    if (names.indexOf(m) < 0) { throw new Error('the catalog does not list ' + m + ' for ' + providerName + ' yet: ' + JSON.stringify(names.slice(0, 20))); }",
+                  "  });",
+                  "}",
+                  "var ok = true, errMsg = '';",
+                  "try { assertNow(); } catch (e) { ok = false; errMsg = e.message; }",
+                  "if (ok) {",
+                  "  pm.collectionVariables.set(pollKey, '0');",
+                  "  pm.test(\"10. wait for the catalog to list b's models [router-same-classifier-settings]\", function () { pm.expect(true, 'assertion satisfied').to.be.true; });",
+                  "} else if (attempt < maxAttempts) {",
+                  "  pm.collectionVariables.set(pollKey, String(attempt + 1));",
+                  "  var sleepMs = Math.min(250 * Math.pow(2, attempt), 4000);",
+                  "  var start = Date.now(); while (Date.now() - start < sleepMs) {}",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set(pollKey, '0');",
+                  "  pm.test(\"10. wait for the catalog to list b's models [router-same-classifier-settings]\", function () { throw new Error('gave up after ' + (maxAttempts + 1) + ' attempts: ' + errMsg); });",
+                  "  pm.execution.setNextRequest(cleanupReq);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/models?provider=catwiring-rt-router-same-classifier-settings-b-{{run_id}}&limit=1000",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "models"
+              ],
+              "query": [
+                {
+                  "key": "provider",
+                  "value": "catwiring-rt-router-same-classifier-settings-b-{{run_id}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "1000"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-11-route",
+          "name": "11. both classifier routers pass the request on and B serves [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var rid = 'rw-router-same-classifier-settings-11-' + pm.variables.get('run_id');",
+                  "pm.collectionVariables.set('reqid_router-same-classifier-settings', rid);",
+                  "pm.request.headers.upsert({ key: 'x-request-id', value: rid });"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "function assertNow() {",
+                  "  if (pm.response.code !== 200) { throw new Error('route status ' + pm.response.code + ' body ' + pm.response.text()); }",
+                  "  var body = pm.response.json();",
+                  "  if (!body.choices || body.choices.length === 0) { throw new Error('no choices'); }",
+                  "  var ri = (body.extra_fields || {}).routing_info || {};",
+                  "  var allowedProviders = ['catwiring-rt-router-same-classifier-settings-b-' + pm.variables.get('run_id')];",
+                  "  if (allowedProviders.indexOf(ri.provider) < 0) { throw new Error('routing_info.provider=' + ri.provider + ' not in ' + JSON.stringify(allowedProviders)); }",
+                  "}",
+                  "var ok = true, errMsg = '';",
+                  "try { assertNow(); } catch (e) { ok = false; errMsg = e.message; }",
+                  "pm.test(\"11. both classifier routers pass the request on and B serves [router-same-classifier-settings]\", function () { if (!ok) { throw new Error(errMsg); } });",
+                  "if (!ok) { pm.execution.setNextRequest(cleanupReq); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/v1/chat/completions",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"model\":\"catwiring-rt-router-same-classifier-settings-{{run_id}}/catwiring-mr06-{{run_id}}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: ok.\"}],\"max_tokens\":5}"
+            }
+          }
+        },
+        {
+          "id": "rt-router-same-classifier-settings-12-assert-trail",
+          "name": "12. trail: one classification, used by both classifier routers [router-same-classifier-settings]",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var pollKey = '__poll_' + pm.info.requestName;",
+                  "var attempt = parseInt(pm.collectionVariables.get(pollKey) || '0', 10);",
+                  "pm.collectionVariables.set('__cur_poll_key', pollKey);",
+                  "pm.collectionVariables.set('__cur_poll_attempt', String(attempt));",
+                  "if (attempt === 0) { var __ws = Date.now(); while (Date.now() - __ws < 2000) {} }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var maxAttempts = 8;",
+                  "var pollKey = '__poll_' + pm.info.requestName;",
+                  "var attempt = parseInt(pm.collectionVariables.get(pollKey) || '0', 10);",
+                  "var cleanupReq = \"cleanup: delete model router r1 [router-same-classifier-settings]\";",
+                  "function assertNow() {",
+                  "  if (pm.response.code !== 200) { throw new Error('log detail status ' + pm.response.code); }",
+                  "  var row = pm.response.json() || {};",
+                  "  var trail = row.routing_engine_logs || '';",
+                  "  var expected = [\"Model router 'catwiring-rtr-router-same-classifier-settings-r1-{{run_id}}'\",\"Model router 'catwiring-rtr-router-same-classifier-settings-r2-{{run_id}}'\",\"; trying the next router\",\"Model router 'catwiring-rtr-router-same-classifier-settings-r3-{{run_id}}' → provider=catwiring-rt-router-same-classifier-settings-b-{{run_id}}\"].map(function (s) { return pm.variables.replaceIn(s); });",
+                  "  expected.forEach(function (s) {",
+                  "    if (String(trail).indexOf(s) < 0) { throw new Error('routing_engine_logs missing ' + JSON.stringify(s) + '; got ' + JSON.stringify(trail)); }",
+                  "  });",
+                  "  var absent = [].map(function (s) { return pm.variables.replaceIn(s); });",
+                  "  absent.forEach(function (s) {",
+                  "    if (String(trail).indexOf(s) >= 0) { throw new Error('routing_engine_logs should not contain ' + JSON.stringify(s) + '; got ' + JSON.stringify(trail)); }",
+                  "  });",
+                  "  var counts = [{\"substring\":\"LLM complexity\",\"count\":1}];",
+                  "  counts.forEach(function (c) {",
+                  "    var s = pm.variables.replaceIn(c.substring);",
+                  "    var n = String(trail).split(s).length - 1;",
+                  "    if (n !== c.count) { throw new Error('routing_engine_logs has ' + JSON.stringify(s) + ' ' + n + ' times, want ' + c.count + '; got ' + JSON.stringify(trail)); }",
+                  "  });",
+                  "}",
+                  "var ok = true, errMsg = '';",
+                  "try { assertNow(); } catch (e) { ok = false; errMsg = e.message; }",
+                  "if (ok) {",
+                  "  pm.collectionVariables.set(pollKey, '0');",
+                  "  pm.test(\"12. trail: one classification, used by both classifier routers [router-same-classifier-settings]\", function () { pm.expect(true, 'assertion satisfied').to.be.true; });",
+                  "} else if (attempt < maxAttempts) {",
+                  "  pm.collectionVariables.set(pollKey, String(attempt + 1));",
+                  "  var sleepMs = Math.min(250 * Math.pow(2, attempt), 4000);",
+                  "  var start = Date.now(); while (Date.now() - start < sleepMs) {}",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set(pollKey, '0');",
+                  "  pm.test(\"12. trail: one classification, used by both classifier routers [router-same-classifier-settings]\", function () { throw new Error('gave up after ' + (maxAttempts + 1) + ' attempts: ' + errMsg); });",
+                  "  pm.execution.setNextRequest(cleanupReq);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/logs/{{reqid_router-same-classifier-settings}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "logs",
+                "{{reqid_router-same-classifier-settings}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Cleanup",
+          "item": [
+            {
+              "id": "rt-router-same-classifier-settings-cleanup-router-r1",
+              "name": "cleanup: delete model router r1 [router-same-classifier-settings]",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test(\"cleanup: delete model router r1 [router-same-classifier-settings]\", function () {",
+                      "  pm.expect([200, 204, 404], 'cleanup status ' + pm.response.code).to.include(pm.response.code);",
+                      "});"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{base_url}}/api/routing/model-routers/catwiring-rtr-router-same-classifier-settings-r1-{{run_id}}",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "api",
+                    "routing",
+                    "model-routers",
+                    "catwiring-rtr-router-same-classifier-settings-r1-{{run_id}}"
+                  ]
+                }
+              }
+            },
+            {
+              "id": "rt-router-same-classifier-settings-cleanup-router-r2",
+              "name": "cleanup: delete model router r2 [router-same-classifier-settings]",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test(\"cleanup: delete model router r2 [router-same-classifier-settings]\", function () {",
+                      "  pm.expect([200, 204, 404], 'cleanup status ' + pm.response.code).to.include(pm.response.code);",
+                      "});"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{base_url}}/api/routing/model-routers/catwiring-rtr-router-same-classifier-settings-r2-{{run_id}}",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "api",
+                    "routing",
+                    "model-routers",
+                    "catwiring-rtr-router-same-classifier-settings-r2-{{run_id}}"
+                  ]
+                }
+              }
+            },
+            {
+              "id": "rt-router-same-classifier-settings-cleanup-router-r3",
+              "name": "cleanup: delete model router r3 [router-same-classifier-settings]",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test(\"cleanup: delete model router r3 [router-same-classifier-settings]\", function () {",
+                      "  pm.expect([200, 204, 404], 'cleanup status ' + pm.response.code).to.include(pm.response.code);",
+                      "});"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{base_url}}/api/routing/model-routers/catwiring-rtr-router-same-classifier-settings-r3-{{run_id}}",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "api",
+                    "routing",
+                    "model-routers",
+                    "catwiring-rtr-router-same-classifier-settings-r3-{{run_id}}"
+                  ]
+                }
+              }
+            },
+            {
+              "id": "rt-router-same-classifier-settings-cleanup-provider-self",
+              "name": "cleanup: delete provider [router-same-classifier-settings]",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test(\"cleanup: delete provider [router-same-classifier-settings]\", function () {",
+                      "  pm.expect([200, 204, 404], 'cleanup status ' + pm.response.code).to.include(pm.response.code);",
+                      "});"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{base_url}}/api/providers/catwiring-rt-router-same-classifier-settings-{{run_id}}",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "api",
+                    "providers",
+                    "catwiring-rt-router-same-classifier-settings-{{run_id}}"
+                  ]
+                }
+              }
+            },
+            {
+              "id": "rt-router-same-classifier-settings-cleanup-provider-b",
+              "name": "cleanup: delete provider b [router-same-classifier-settings]",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test(\"cleanup: delete provider b [router-same-classifier-settings]\", function () {",
+                      "  pm.expect([200, 204, 404], 'cleanup status ' + pm.response.code).to.include(pm.response.code);",
+                      "});"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{base_url}}/api/providers/catwiring-rt-router-same-classifier-settings-b-{{run_id}}",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "api",
+                    "providers",
+                    "catwiring-rt-router-same-classifier-settings-b-{{run_id}}"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "var required = [];",
+              "for (var i = 0; i < required.length; i++) {",
+              "  var v = required[i];",
+              "  if (!pm.variables.get(v) && !pm.environment.get(v)) {",
+              "    console.log('SKIP: missing ' + v);",
+              "    pm.execution.skipRequest();",
+              "    return;",
+              "  }",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
       "name": "The model router API refuses a tier on a conditional router, a name taken in its scope and an unknown mode",
       "description": "A conditional router's targets name no tier, so a target with one is refused. A name another router in the same scope already has is refused on create, since names are kept apart within a scope. An unknown mode is refused, and a conditional router has no classifier to reset. Each refusal is a 400 or a 409 with a message that says what to fix.",
       "item": [

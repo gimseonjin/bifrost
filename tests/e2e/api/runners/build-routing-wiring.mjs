@@ -804,6 +804,17 @@ function expandScenario(sc) {
           "  if (String(trail).indexOf(s) >= 0) { throw new Error('routing_engine_logs should not contain ' + JSON.stringify(s) + '; got ' + JSON.stringify(trail)); }",
           "});",
         ];
+        // expectCounts: how many times a substring appears, for what must happen once.
+        if (step.expectCounts) {
+          trailAssert.push(
+            `var counts = ${JSON.stringify(step.expectCounts)};`,
+            "counts.forEach(function (c) {",
+            "  var s = pm.variables.replaceIn(c.substring);",
+            "  var n = String(trail).split(s).length - 1;",
+            "  if (n !== c.count) { throw new Error('routing_engine_logs has ' + JSON.stringify(s) + ' ' + n + ' times, want ' + c.count + '; got ' + JSON.stringify(trail)); }",
+            "});",
+          );
+        }
         items.push(item(nextId("assert-trail"), trailName,
           request("GET", url(["api", "logs", `{{${logIdVar}}}`]), null),
           events(step.fromRequest ? pollPrerequest(step.waitSeconds) : null, pollTest(trailName, trailAssert, cleanupTarget))));
@@ -853,6 +864,15 @@ function expandScenario(sc) {
 // --------------------------------------------------------------------------- //
 // Scenarios — governance × model-catalog routing
 // --------------------------------------------------------------------------- //
+
+// The classifier settings both classifier routers of router-same-classifier-settings are given:
+// the llm classifier on the scenario's own provider, with one phrase a tier. One function, so the
+// two routers cannot drift apart.
+const sameClassifierSettings = (nameOf) => ({
+  classifier: "llm",
+  llm: { provider: nameOf("self"), model: MODEL_B },
+  keywords: { simple_keywords: ["what time is it"], medium_keywords: ["summarise this paragraph"], complex_keywords: ["design a distributed cache"] },
+});
 
 const SCENARIOS = [
   {
@@ -1477,6 +1497,21 @@ const SCENARIOS = [
       { type: "route", model: "catwiring-mr05-{{run_id}}", useVk: false, requestId: true, expectStatus: 200, label: "original_model: the classifier router keeps the request and A serves" },
       { type: "assertRoutingTrail", fromRequest: true, expectSubstrings: ["; keeping provider=catwiring-rt-router-empty-target-{{run_id}}, model=catwiring-mr05-{{run_id}}"], expectAbsent: ["Model router 'catwiring-rtr-router-empty-target-r2-{{run_id}}'"], waitSeconds: 2, label: "trail: the classifier router keeps the request and the second router is not asked" },
       { type: "routerApi", ref: "r1", method: "PUT", path: ["routing"], body: { empty_target: "skip" }, expectStatus: 400, expectErrorSubstr: "invalid empty_target \"skip\": must be one of: next_router, original_model", label: "an unknown empty_target is refused (400)" },
+      { type: "cleanup" },
+    ],
+  },
+  {
+    id: "router-same-classifier-settings",
+    title: "Classifier model routers with the same classifier settings classify a request once",
+    description: "Two classifier routers take this run's own model, classify with the same settings and have no targets, so each passes the request to the next router; a conditional router after them sends it to B. The second router reuses the first one's answer: the trail holds one classification, whether it produced a tier or not, and each router's own line.",
+    steps: [
+      { type: "addProvider", ref: "self", keys: [key({ id: "ka", models: ["catwiring-mr06-{{run_id}}", MODEL_B], aliases: { "catwiring-mr06-{{run_id}}": MODEL_B } })] },
+      { type: "addProvider", ref: "b", keys: [key({ id: "kb", models: ["catwiring-mr06-{{run_id}}"], aliases: { "catwiring-mr06-{{run_id}}": MODEL_B } })] },
+      { type: "createRouter", ref: "r1", mode: "classifier", classifier: sameClassifierSettings, cel: "model == 'catwiring-mr06-{{run_id}}'", priority: 0, emptyTarget: "next_router", label: "create a classifier router with no targets and empty_target next_router" },
+      { type: "createRouter", ref: "r2", mode: "classifier", classifier: sameClassifierSettings, cel: "model == 'catwiring-mr06-{{run_id}}'", priority: 1, emptyTarget: "next_router", label: "create a second classifier router with the same classifier settings" },
+      { type: "createRouter", ref: "r3", cel: "model == 'catwiring-mr06-{{run_id}}'", priority: 2, targets: [{ providerRef: "b", model: "catwiring-mr06-{{run_id}}" }], label: "create a conditional router after them: this run's model goes to B" },
+      { type: "route", model: "catwiring-mr06-{{run_id}}", useVk: false, requestId: true, expectStatus: 200, expectProviderOneOf: ["b"], label: "both classifier routers pass the request on and B serves" },
+      { type: "assertRoutingTrail", fromRequest: true, expectSubstrings: ["Model router 'catwiring-rtr-router-same-classifier-settings-r1-{{run_id}}'", "Model router 'catwiring-rtr-router-same-classifier-settings-r2-{{run_id}}'", "; trying the next router", "Model router 'catwiring-rtr-router-same-classifier-settings-r3-{{run_id}}' → provider=catwiring-rt-router-same-classifier-settings-b-{{run_id}}"], expectCounts: [{ substring: "LLM complexity", count: 1 }], waitSeconds: 2, label: "trail: one classification, used by both classifier routers" },
       { type: "cleanup" },
     ],
   },
