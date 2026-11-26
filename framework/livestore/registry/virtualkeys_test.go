@@ -10,16 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testKeyReads reads keys as the live store does, keeping their grant sets by ID in the map it
-// returns.
-func testKeyReads() (KeyReads, map[GrantSetID]*GrantSet) {
-	sets := map[GrantSetID]*GrantSet{}
-	return KeyReads{Grants: func(g *GrantSet) GrantSetID {
-		sets[g.ID] = g
-		return g.ID
-	}}, sets
-}
-
 // virtualKeyIDsOf lists the IDs of key records in the order given.
 func virtualKeyIDsOf(rows []*VirtualKey) []string {
 	ids := make([]string, 0, len(rows))
@@ -87,11 +77,10 @@ func TestVirtualKeysPageAndRecord(t *testing.T) {
 		&tables.TableVirtualKeyVirtualMCP{VirtualKeyID: "vk-a", VirtualMCPID: 1},
 	)
 
-	reads, sets := testKeyReads()
 	var walked []*VirtualKey
 	after := ""
 	for {
-		rows, next, err := reads.Page(ctx, db, after, 2)
+		rows, next, err := VirtualKeysPage(ctx, db, after, 2)
 		require.NoError(t, err)
 		walked = append(walked, rows...)
 		if next == "" {
@@ -106,8 +95,8 @@ func TestVirtualKeysPageAndRecord(t *testing.T) {
 	require.Equal(t, "sk-a", full.Value)
 	require.True(t, full.Active, "a key with no is_active value is active")
 	require.True(t, full.CalendarAligned)
-	grants := sets[full.Grants]
-	require.NotNil(t, grants, "the key's grant set was stored")
+	grants := full.Grants
+	require.NotNil(t, grants, "the key carries its grant set")
 	require.True(t, grants.AllowAllProviders)
 	require.Equal(t, ptr(true), full.DisableContentLogging)
 	require.Equal(t, map[string]string{"env": "prod"}, full.Metadata)
@@ -132,8 +121,8 @@ func TestVirtualKeysPageAndRecord(t *testing.T) {
 	require.False(t, rotating.Active)
 	require.Equal(t, "cust-1", VirtualKeyCustomerID(rotating))
 	require.Empty(t, rotating.BudgetIDs)
-	require.Empty(t, sets[rotating.Grants].VirtualMCPIDs)
-	require.Equal(t, sets[rotating.Grants], sets[plain.Grants], "keys granted the same things share one grant set")
+	require.Empty(t, rotating.Grants.VirtualMCPIDs)
+	require.Equal(t, rotating.Grants.ID, plain.Grants.ID, "keys granted the same things get one grant set ID, which the store shares")
 	require.Equal(t, "sk-b-old", rotating.PreviousValue)
 	require.Equal(t, graceUntil.UnixNano(), rotating.PreviousValueExpiresAt)
 	require.Equal(t, []string{"sk-b-old"}, VirtualKeyPreviousValue(rotating))
@@ -150,7 +139,7 @@ func TestVirtualKeysPageAndRecord(t *testing.T) {
 	require.Zero(t, plain.ExpiresAt)
 	require.False(t, plain.IsExpiredAt(now), "a key with no expiry never expires")
 
-	rows, err := reads.ByID(ctx, db, []string{"vk-c", "missing"})
+	rows, err := VirtualKeysByID(ctx, db, []string{"vk-c", "missing"})
 	require.NoError(t, err)
 	require.Equal(t, []string{"vk-c"}, virtualKeyIDsOf(rows), "an ID with no row is left out")
 	keyIDs, err := VirtualKeyIDsByTeams(ctx, db, []string{"team-1"})
@@ -173,8 +162,7 @@ func TestVirtualKeyUnresolvedValueIsNotIndexed(t *testing.T) {
 	require.NoError(t, db.Model(&tables.TableVirtualKey{}).Where("id = ?", "vk-env").
 		UpdateColumn("value", "env.BIFROST_REGISTRY_TEST_UNSET_VARIABLE").Error)
 
-	reads, _ := testKeyReads()
-	rows, err := reads.ByID(ctx, db, []string{"vk-env"})
+	rows, err := VirtualKeysByID(ctx, db, []string{"vk-env"})
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	require.Empty(t, rows[0].Value)
@@ -193,23 +181,18 @@ func TestVirtualKeyUnresolvedValueIsNotIndexed(t *testing.T) {
 // provider config's rate limit is named by ID only.
 func TestVirtualKeyFromTableNamesConfigRateLimits(t *testing.T) {
 	expires := time.Unix(1_700_000_000, 0)
-	var stored *GrantSet
 	rec := VirtualKeyFromTable(&tables.TableVirtualKey{
 		ID: "vk-1", Name: "file", Value: *schemas.NewSecretVar("sk-file"), ExpiresAt: &expires,
 		ProviderConfigs: []tables.TableVirtualKeyProviderConfig{{
 			Provider: "openai", RateLimitID: ptr("rl-1"), RateLimit: &tables.TableRateLimit{ID: "rl-1"},
 		}},
-	}, []string{"b-1"}, []uint{4}, func(g *GrantSet) GrantSetID {
-		stored = g
-		return g.ID
-	})
+	}, []string{"b-1"}, []uint{4})
 	require.Equal(t, "sk-file", rec.Value)
 	require.True(t, rec.Active)
 	require.Equal(t, expires.UnixNano(), rec.ExpiresAt)
 	require.Equal(t, []string{"b-1"}, rec.BudgetIDs)
-	require.NotNil(t, stored)
-	require.Equal(t, stored.ID, rec.Grants)
-	require.Equal(t, []uint{4}, stored.VirtualMCPIDs)
+	require.NotNil(t, rec.Grants)
+	require.Equal(t, []uint{4}, rec.Grants.VirtualMCPIDs)
 	require.Equal(t, []ProviderLimit{{Provider: "openai", RateLimitID: "rl-1"}}, rec.ProviderLimits)
 }
 
