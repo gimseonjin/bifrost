@@ -363,6 +363,15 @@ type ConfigStore interface {
 	// Vector store config CRUD
 	UpdateVectorStoreConfig(ctx context.Context, config *vectorstore.Config) error
 	GetVectorStoreConfig(ctx context.Context) (*vectorstore.Config, error)
+	// ListVectorStoreSettings returns every stored vector store's settings.
+	ListVectorStoreSettings(ctx context.Context) ([]tables.TableVectorStoreSettings, error)
+	// GetVectorStoreSettings returns one vector store's settings by its name, or ErrNotFound.
+	GetVectorStoreSettings(ctx context.Context, name string) (*tables.TableVectorStoreSettings, error)
+	// UpsertVectorStoreSettings writes one vector store's settings, creating its row if needed.
+	UpsertVectorStoreSettings(ctx context.Context, settings *tables.TableVectorStoreSettings, tx ...*gorm.DB) error
+	// UpdateVectorStoreSettings changes only the settings given (nil leaves one as stored),
+	// creating the row if needed, so overlapping edits of different settings both stay.
+	UpdateVectorStoreSettings(ctx context.Context, name string, retentionDays, maxSizeMB *int) error
 
 	// Logs store config CRUD
 	UpdateLogsStoreConfig(ctx context.Context, config *logstore.Config) error

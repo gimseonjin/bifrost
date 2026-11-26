@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -83,12 +84,18 @@ func newChromemStore(_ context.Context, config *ChromemConfig, logger schemas.Lo
 		return nil, fmt.Errorf("chromem config is required")
 	}
 
+	// Cleaned as Config.Location cleans it, so the directory opened is the one two entries are
+	// compared by when the registry decides whether they are one store.
+	path := strings.TrimSpace(config.Path)
+	if path != "" {
+		path = filepath.Clean(path)
+	}
 	var db *chromem.DB
 	var err error
-	if strings.TrimSpace(config.Path) != "" {
-		db, err = chromem.NewPersistentDB(config.Path, config.Compress)
+	if path != "" {
+		db, err = chromem.NewPersistentDB(path, config.Compress)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open chromem persistent db at %s: %w", config.Path, err)
+			return nil, fmt.Errorf("failed to open chromem persistent db at %s: %w", path, err)
 		}
 	} else {
 		db = chromem.NewDB()
