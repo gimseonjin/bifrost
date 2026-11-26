@@ -209,3 +209,273 @@ test.describe('Warp semantic search threshold', () => {
     await expect(page.getByTestId('warp-search-threshold-input')).toHaveValue('0.62')
   })
 })
+
+// Warp keeps its log index in one of the vector stores configured in
+// config.json (the primary vector_store or a vector_stores entry), chosen on
+// the settings page. The picker appears only when there is a choice to make,
+// and a store switched to starts empty, so the page says so before the save.
+
+type ListedVectorStore = {
+  name: string
+  type: string
+  primary: boolean
+  status: 'connected' | 'failed' | 'disabled'
+  error: string
+  shared_with: string
+  endpoint: string
+  retention_days: number
+  max_size_mb: number
+}
+
+function listedStore(name: string, type: string, primary: boolean, status: ListedVectorStore['status'] = 'connected', error = ''): ListedVectorStore {
+  return { name, type, primary, status, error, shared_with: '', endpoint: '', retention_days: 0, max_size_mb: 0 }
+}
+
+const primaryStore = listedStore('default', 'weaviate', true)
+const qdrantStore = listedStore('warp-qdrant', 'qdrant', false)
+const failedStore = listedStore('warp-redis', 'redis', false, 'failed', 'dial tcp 127.0.0.1:6379: connection refused')
+
+const warpOnPrimary = {
+  ...configuredWarp,
+  vector_store: '',
+  connected_vector_store: { name: 'default', type: 'weaviate', primary: true },
+}
+
+// The warp flag is shared server state; turned on in this page's view only.
+async function showWarpFlag(page: Page) {
+  await page.route('**/api/feature-flags', async (route) => {
+    if (route.request().method() !== 'GET') return route.continue()
+    const response = await route.fetch()
+    const body = (await response.json()) as { flags: { id: string; enabled: boolean }[] }
+    body.flags = body.flags.map((flag) => (flag.id === 'warp' ? { ...flag, enabled: true } : flag))
+    await route.fulfill({ response, json: body })
+  })
+}
+
+/**
+ * Mocks the Warp config, the store list and an idle backfill. A PUT answers
+ * with `putResponse` when given; otherwise it is saved, and a vector_store in
+ * it moves connected_vector_store to that store ("" is the primary).
+ */
+async function mockWarpVectorStores(
+  page: Page,
+  stores: ListedVectorStore[],
+  options: { config?: object; putResponse?: { status: number; body: object } } = {},
+) {
+  await acknowledgeMCPNotice(page)
+  await showWarpFlag(page)
+  const puts: Record<string, unknown>[] = []
+  let saved: object = options.config ?? warpOnPrimary
+  await page.route('**/api/warp/config', async (route) => {
+    if (route.request().method() === 'PUT') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      puts.push(body)
+      if (options.putResponse) {
+        return route.fulfill({ status: options.putResponse.status, contentType: 'application/json', body: JSON.stringify(options.putResponse.body) })
+      }
+      if (typeof body.vector_store === 'string') {
+        const chosen = body.vector_store
+        const store = stores.find((s) => (chosen === '' ? s.primary : s.name === chosen))
+        saved = {
+          ...saved,
+          vector_store: chosen,
+          vector_store_connected: !!store,
+          connected_vector_store: store ? { name: store.name, type: store.type, primary: store.primary } : null,
+        }
+      }
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(saved) })
+  })
+  await page.route('**/api/config/vector-stores', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ editable: true, vector_stores: stores }) }),
+  )
+  await page.route('**/api/warp/log-index/backfill/status**', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'idle' }) }),
+  )
+  return puts
+}
+
+/** Opens the settings page and waits until the config and the store list have both rendered. */
+async function openWarpSettings(page: Page) {
+  await page.goto('/workspace/config/warp')
+  // Set once the store list is rendered, an empty one included: a response that has arrived is
+  // not yet a page that shows it, so checking the picker's absence before this proves nothing.
+  await expect(page.getByTestId('warp-vector-store-status')).toHaveAttribute('data-vector-stores-loaded', 'true')
+}
+
+test.describe('Warp vector store picker', () => {
+  for (const stores of [[], [primaryStore]]) {
+    test(`is absent with ${stores.length} configured store(s)`, async ({ page }) => {
+      await mockWarpVectorStores(page, stores)
+      await openWarpSettings(page)
+
+      await expect(page.getByTestId('warp-vector-store-select')).toHaveCount(0)
+      await expect(page.getByTestId('warp-vector-store-status')).toContainText('default')
+    })
+  }
+
+  test('lists every store, switches to another, and reports the new one after saving', async ({ page }) => {
+    const puts = await mockWarpVectorStores(page, [primaryStore, qdrantStore, failedStore])
+    await openWarpSettings(page)
+
+    const select = page.getByTestId('warp-vector-store-select')
+    await expect(select).toBeVisible()
+    // "" is the primary store, shown by its name.
+    await expect(select).toContainText('default')
+    await expect(page.getByTestId('warp-vector-store-status')).toContainText('default')
+    await expect(page.getByTestId('warp-vector-store-switch-note')).toHaveCount(0)
+
+    await select.click()
+    await expect(page.getByTestId('warp-vector-store-option-default')).toBeVisible()
+    await expect(page.getByTestId('warp-vector-store-option-warp-qdrant')).toContainText('qdrant')
+    // A store the server cannot reach is listed but cannot be picked.
+    const failed = page.getByTestId('warp-vector-store-option-warp-redis')
+    await expect(failed).toBeVisible()
+    await expect(failed).toHaveAttribute('aria-disabled', 'true')
+
+    await page.getByTestId('warp-vector-store-option-warp-qdrant').click()
+    await expect(select).toContainText('warp-qdrant')
+    const note = page.getByTestId('warp-vector-store-switch-note')
+    await expect(note).toBeVisible()
+    await expect(note).toContainText('warp-qdrant')
+
+    const put = page.waitForResponse((r) => new URL(r.url()).pathname.endsWith('/api/warp/config') && r.request().method() === 'PUT')
+    await page.getByTestId('warp-save-btn').click()
+    const res = await put
+    expect(res.status(), await res.text()).toBe(200)
+    expect(puts).toHaveLength(1)
+    expect(puts[0].vector_store).toBe('warp-qdrant')
+
+    await expect(page.getByTestId('warp-vector-store-status')).toContainText('warp-qdrant')
+    await expect(note).toHaveCount(0)
+  })
+
+  test('sends "" when switching back to the primary store', async ({ page }) => {
+    const onQdrant = {
+      ...configuredWarp,
+      vector_store: 'warp-qdrant',
+      connected_vector_store: { name: 'warp-qdrant', type: 'qdrant', primary: false },
+    }
+    const puts = await mockWarpVectorStores(page, [primaryStore, qdrantStore], { config: onQdrant })
+    await openWarpSettings(page)
+
+    await page.getByTestId('warp-vector-store-select').click()
+    await page.getByTestId('warp-vector-store-option-default').click()
+    await expect(page.getByTestId('warp-vector-store-switch-note')).toBeVisible()
+
+    const put = page.waitForResponse((r) => new URL(r.url()).pathname.endsWith('/api/warp/config') && r.request().method() === 'PUT')
+    await page.getByTestId('warp-save-btn').click()
+    expect((await put).status()).toBe(200)
+    expect(puts[0].vector_store).toBe('')
+    await expect(page.getByTestId('warp-vector-store-status')).toContainText('default')
+  })
+
+  // An untouched picker leaves the stored choice alone: the field is omitted.
+  test('omits vector_store from a save that did not change the store', async ({ page }) => {
+    const puts = await mockWarpVectorStores(page, [primaryStore, qdrantStore])
+    await openWarpSettings(page)
+
+    await page.getByTestId('warp-search-limit-input').fill('12')
+    const put = page.waitForResponse((r) => new URL(r.url()).pathname.endsWith('/api/warp/config') && r.request().method() === 'PUT')
+    await page.getByTestId('warp-save-btn').click()
+    expect((await put).status()).toBe(200)
+    expect(puts).toHaveLength(1)
+    expect('vector_store' in puts[0]).toBe(false)
+  })
+
+  test('shows the server refusal when a backfill is running', async ({ page }) => {
+    await mockWarpVectorStores(page, [primaryStore, qdrantStore], {
+      putResponse: { status: 409, body: { error: { message: 'a backfill is in progress' } } },
+    })
+    await openWarpSettings(page)
+
+    await page.getByTestId('warp-vector-store-select').click()
+    await page.getByTestId('warp-vector-store-option-warp-qdrant').click()
+    await page.getByTestId('warp-save-btn').click()
+    await expect(page.getByText('A backfill is in progress')).toBeVisible()
+    // Nothing was saved, so the switch is still pending.
+    await expect(page.getByTestId('warp-vector-store-switch-note')).toBeVisible()
+  })
+
+  test('shows why Warp has no store when the chosen one is unavailable', async ({ page }) => {
+    const reason = 'Warp\'s vector store "warp-qdrant" could not be reached at startup'
+    await mockWarpVectorStores(page, [primaryStore, listedStore('warp-qdrant', 'qdrant', false, 'failed', 'dial tcp: i/o timeout')], {
+      config: {
+        ...configuredWarp,
+        vector_store: 'warp-qdrant',
+        vector_store_connected: false,
+        connected_vector_store: null,
+        vector_store_error: reason,
+      },
+    })
+    await openWarpSettings(page)
+
+    await expect(page.getByTestId('warp-vector-store-status')).toHaveText(reason)
+  })
+})
+
+// Against the real server: runs only where config.json configures at least two
+// vector stores, and puts Warp back on the store it started on.
+test.describe('Warp vector store switch on the server', () => {
+  test('switches Warp to another connected store and reports it', async ({ page }) => {
+    await acknowledgeMCPNotice(page)
+    await showWarpFlag(page)
+
+    const listedRes = await page.request.get('/api/config/vector-stores')
+    expect(listedRes.status(), await listedRes.text()).toBe(200)
+    const stores = ((await listedRes.json()) as { vector_stores: ListedVectorStore[] }).vector_stores
+    test.skip(
+      stores.length < 2,
+      `the E2E server profile configures ${stores.length} vector store(s) (vector_store / vector_stores in config.json); switching Warp's store needs at least two`,
+    )
+
+    const configRes = await page.request.get('/api/warp/config')
+    test.skip(configRes.status() !== 200, `Warp's settings are not available on this server (GET /api/warp/config answered ${configRes.status()})`)
+    const config = (await configRes.json()) as { vector_store: string }
+    const current = config.vector_store || stores.find((s) => s.primary)?.name || ''
+    const original = stores.find((s) => s.name === current)
+    const target = stores.find((s) => s.name !== current && s.status === 'connected')
+    test.skip(
+      original?.status !== 'connected' || !target,
+      'needs Warp on a connected store and another connected store to switch to, so the test can switch back',
+    )
+    const from = original as ListedVectorStore
+    const to = target as ListedVectorStore
+
+    const pick = async (store: ListedVectorStore) => {
+      await page.getByTestId('warp-vector-store-select').click()
+      await page.getByTestId(`warp-vector-store-option-${store.name}`).click()
+    }
+    const save = async (store: ListedVectorStore) => {
+      const put = page.waitForResponse((r) => new URL(r.url()).pathname.endsWith('/api/warp/config') && r.request().method() === 'PUT')
+      await page.getByTestId('warp-save-btn').click()
+      const res = await put
+      expect(res.status(), await res.text()).toBe(200)
+      expect(res.request().postDataJSON().vector_store).toBe(store.primary ? '' : store.name)
+      await expect(page.getByTestId('warp-vector-store-status')).toContainText(store.name)
+    }
+
+    await openWarpSettings(page)
+    await page.getByTestId('warp-vector-store-select').click()
+    for (const store of stores) {
+      await expect(page.getByTestId(`warp-vector-store-option-${store.name}`)).toBeVisible()
+    }
+    await page.keyboard.press('Escape')
+
+    try {
+      await pick(to)
+      await expect(page.getByTestId('warp-vector-store-switch-note')).toBeVisible()
+      await save(to)
+      const after = (await (await page.request.get('/api/warp/config')).json()) as { connected_vector_store: { name: string } | null }
+      expect(after.connected_vector_store?.name).toBe(to.name)
+    } finally {
+      // Put Warp back on the store it started on, if the switch was saved.
+      const now = (await (await page.request.get('/api/warp/config')).json()) as { vector_store: string }
+      if ((now.vector_store || stores.find((s) => s.primary)?.name) !== from.name) {
+        await openWarpSettings(page)
+        await pick(from)
+        await save(from)
+      }
+    }
+  })
+})

@@ -13,6 +13,7 @@ import (
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/sidekiq"
+	"github.com/maximhq/bifrost/framework/vectorstore"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -47,6 +48,7 @@ type BackfillJobMeta struct {
 	EndTime         time.Time  `json:"end_time"`
 	ConfigSignature string     `json:"config_signature"`
 	Namespace       string     `json:"namespace"`
+	VectorIndex     string     `json:"vector_index,omitempty"` // the index built (TableWarpConfig.VectorIndexID); "" for one that never moved
 	CursorTime      *time.Time `json:"cursor_time,omitempty"`
 	CursorOffset    int        `json:"cursor_offset,omitempty"`
 	Total           int64      `json:"total"`
@@ -149,6 +151,14 @@ func (s *Service) BuildBackfillJobMeta(ctx context.Context, start, end time.Time
 	if !start.Before(end) {
 		return "", fmt.Errorf("%w: start_time must be before end_time", ErrInvalidConfig)
 	}
+	// No store is its own error, before the rest: when the store Warp is set to use is
+	// unavailable, that is what the admin has to fix, not "not configured". The row is read
+	// first, so the store is the one the configuration chooses now.
+	if s.store != nil {
+		if _, err := s.store.GetWarpConfig(ctx); err == nil && !s.hasVectorStore() {
+			return "", s.noVectorStore()
+		}
+	}
 	if s.logs == nil || s.indexer == nil {
 		return "", ErrUnavailable
 	}
@@ -178,7 +188,7 @@ func (s *Service) BuildBackfillJobMeta(ctx context.Context, start, end time.Time
 	if result.Pagination.TotalCount > total {
 		total = result.Pagination.TotalCount
 	}
-	meta := BackfillJobMeta{StartTime: start, EndTime: end, ConfigSignature: signature, Namespace: config.EffectiveLogVectorStoreNamespace(), Total: total}
+	meta := BackfillJobMeta{StartTime: start, EndTime: end, ConfigSignature: signature, Namespace: config.EffectiveLogVectorStoreNamespace(), VectorIndex: s.currentVectorIndex(), Total: total}
 	return marshalBackfillMeta(meta)
 }
 
@@ -206,6 +216,19 @@ func (s *Service) BackfillMatchesConfig(ctx context.Context, metadata string) bo
 	return meta.ConfigSignature == embeddingConfigSignature(config)
 }
 
+// BackfillMatchesStore reports whether a backfill built the index Warp keeps now:
+// moving the index to another store starts a new one, which no earlier run filled.
+// The embedding signature cannot carry this: topics are keyed by it in the log
+// store and stay valid when the vectors move, so a move changes only whether the
+// index is built. Metadata that does not parse is left to BackfillMatchesConfig.
+func (s *Service) BackfillMatchesStore(metadata string) bool {
+	var meta BackfillJobMeta
+	if sonic.Unmarshal([]byte(metadata), &meta) != nil {
+		return true
+	}
+	return s.checkpointIsForThisIndex(meta.VectorIndex)
+}
+
 // resumableBackfillMeta looks for the most recent backfill job that stopped
 // partway through this exact frozen window under this exact embedding
 // configuration, and returns its checkpoint. A job that ran to completion
@@ -231,6 +254,11 @@ func (s *Service) resumableBackfillMeta(ctx context.Context, start, end time.Tim
 		return BackfillJobMeta{}, false, nil
 	}
 	if meta.CursorTime == nil || !meta.StartTime.Equal(start) || !meta.EndTime.Equal(end) || meta.ConfigSignature != signature {
+		return BackfillJobMeta{}, false, nil
+	}
+	// Only into the index it was building: resuming in another would skip every log the old
+	// run indexed into the one before.
+	if !s.checkpointIsForThisIndex(meta.VectorIndex) {
 		return BackfillJobMeta{}, false, nil
 	}
 	meta.LastError = ""
@@ -270,6 +298,17 @@ func (s *Service) RunBackfillJob(ctx context.Context, job tables.TableSidekiqJob
 		if embeddingConfigSignature(config) != meta.ConfigSignature {
 			return snapshot(), fmt.Errorf("Warp embedding configuration changed while backfill was running")
 		}
+		// Checked on every page, after the read above has followed the configuration: a job
+		// picked back up after a restart, or one running while another node moved the index,
+		// would otherwise write past a cursor the new index never had. It stops and keeps its
+		// checkpoint. The page writes into the store settled here.
+		if !s.checkpointIsForThisIndex(meta.VectorIndex) {
+			return snapshot(), fmt.Errorf("Warp's log index moved to another vector store since this backfill was started; start a new backfill")
+		}
+		vectors := s.currentVectorStore()
+		if vectors == nil {
+			return snapshot(), s.noVectorStore()
+		}
 
 		start := meta.StartTime
 		if meta.CursorTime != nil {
@@ -285,7 +324,7 @@ func (s *Service) RunBackfillJob(ctx context.Context, job tables.TableSidekiqJob
 			break
 		}
 
-		outcomes, spend, pageErr := s.indexBackfillPage(ctx, config, result.Logs)
+		outcomes, spend, pageErr := s.indexBackfillPage(ctx, config, vectors, result.Logs)
 		// Recorded before anything below can return: a page that is cut short or
 		// rolled back is retried on resume, but the calls it already made were
 		// billed and are not refunded by the retry. spend also covers logs cut
@@ -424,7 +463,7 @@ func (s *Service) fetchBackfillLogsIndividually(ctx context.Context, ids []strin
 	return entries, nil
 }
 
-func (s *Service) indexBackfillPage(ctx context.Context, config *schemas.WarpConfig, logs []logstore.Log) ([]backfillPageOutcome, []*schemas.BifrostLLMUsage, error) {
+func (s *Service) indexBackfillPage(ctx context.Context, config *schemas.WarpConfig, vectors vectorstore.VectorStore, logs []logstore.Log) ([]backfillPageOutcome, []*schemas.BifrostLLMUsage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -475,7 +514,7 @@ func (s *Service) indexBackfillPage(ctx context.Context, config *schemas.WarpCon
 			// The config verified for this job, not a fresh read: a save landing
 			// between the check in RunBackfillJob and this write would otherwise
 			// index into a different embedding space than the job froze.
-			outcome, usage, indexErr := s.indexer.IndexWithConfig(groupCtx, config, entry)
+			outcome, usage, indexErr := s.indexer.indexInto(groupCtx, config, vectors, entry)
 			if cancelErr := ctx.Err(); cancelErr != nil {
 				// ctx was cancelled while this log was mid-flight. Checked
 				// regardless of whether indexing reported an error: a cancellation

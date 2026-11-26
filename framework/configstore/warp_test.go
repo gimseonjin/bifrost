@@ -2,6 +2,9 @@ package configstore
 
 import (
 	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -258,4 +261,117 @@ func TestWarpConfigMigrationAddsVirtualKeyIDColumn(t *testing.T) {
 	config, err = store.GetWarpConfig(ctx)
 	require.NoError(t, err)
 	require.Equal(t, "vk-warp", config.VirtualKeyID)
+}
+
+// An existing Warp row gains the store its index is kept in, "" (the primary
+// store, where it already is), an index that never moved, and nothing to delete.
+func TestWarpConfigMigrationAddsVectorStoreColumns(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: gormlogger.Default.LogMode(gormlogger.Silent)})
+	require.NoError(t, err)
+	ctx := context.Background()
+	require.NoError(t, db.AutoMigrate(&tables.TableWarpConfig{}))
+	for _, column := range []string{"vector_store", "vector_store_id", "vector_index_id", "vector_store_cleanup"} {
+		require.NoError(t, db.Migrator().DropColumn(&tables.TableWarpConfig{}, column))
+	}
+	now := time.Now().UTC()
+	require.NoError(t, db.Exec(
+		"INSERT INTO warp_config (id, enabled, provider, model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+		tables.WarpConfigRowID, true, "openai", "gpt-4o", now, now).Error)
+
+	require.NoError(t, migrationAddWarpVectorStoreColumn(ctx, db, testMigrationLogger))
+	store := &RDBConfigStore{}
+	store.db.Store(db)
+	config, err := store.GetWarpConfig(ctx)
+	require.NoError(t, err)
+	require.Empty(t, config.VectorStore)
+	require.Empty(t, config.VectorStoreID)
+	require.Empty(t, config.VectorIndexID)
+	require.Nil(t, config.VectorStoreCleanup)
+}
+
+// A merging write hands merge the row as stored (nil before the first), and
+// writes what merge leaves on the new row.
+func TestWarpConfigUpsertMergingSeesTheStoredRow(t *testing.T) {
+	store := setupRDBTestStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.DB().AutoMigrate(&tables.TableWarpConfig{}))
+	var seen []*tables.TableWarpConfig
+	merge := func(next *tables.TableWarpConfig) func(*tables.TableWarpConfig) error {
+		return func(stored *tables.TableWarpConfig) error {
+			seen = append(seen, stored)
+			next.VectorStoreCleanup = nil
+			if stored != nil {
+				left := `[{"store":"` + stored.VectorStore + `"}]`
+				next.VectorStoreCleanup = &left
+			}
+			return nil
+		}
+	}
+	first := &tables.TableWarpConfig{Provider: "openai", Model: "gpt-4o", VectorStore: "shared"}
+	require.NoError(t, store.UpsertWarpConfigMerging(ctx, first, merge(first)))
+	second := &tables.TableWarpConfig{Provider: "openai", Model: "gpt-4o", VectorStore: "warp-qdrant"}
+	require.NoError(t, store.UpsertWarpConfigMerging(ctx, second, merge(second)))
+
+	require.Len(t, seen, 2)
+	require.Nil(t, seen[0], "nothing stored before the first write")
+	require.Equal(t, "shared", seen[1].VectorStore)
+	got, err := store.GetWarpConfig(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "warp-qdrant", got.VectorStore)
+	require.NotNil(t, got.VectorStoreCleanup)
+	require.Equal(t, `[{"store":"shared"}]`, *got.VectorStoreCleanup)
+
+	refused := errors.New("refused")
+	require.ErrorIs(t, store.UpsertWarpConfigMerging(ctx, &tables.TableWarpConfig{VectorStore: "other"}, func(*tables.TableWarpConfig) error { return refused }), refused)
+	got, err = store.GetWarpConfig(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "warp-qdrant", got.VectorStore, "a merge that fails writes nothing")
+}
+
+// Two first saves on Postgres find no row to lock, so both get as far as the
+// insert. They cannot both write from "nothing stored": the one that finds the
+// row taken merges again from the row the other wrote, and writes over it.
+func TestPostgresWarpConfigFirstSavesMergeFromEachOther(t *testing.T) {
+	first := setupPostgresDeadlockStore(t)
+	second := newEncryptionPodStore(t)
+	ctx := context.Background()
+	var arrived atomic.Int32
+	bothFoundNone := make(chan struct{})
+	save := func(store *RDBConfigStore, name string, seen *[]*tables.TableWarpConfig) error {
+		row := &tables.TableWarpConfig{Provider: "openai", Model: "gpt-4o", VectorStore: name}
+		return store.UpsertWarpConfigMerging(ctx, row, func(stored *tables.TableWarpConfig) error {
+			*seen = append(*seen, stored)
+			if len(*seen) == 1 && arrived.Add(1) == 2 {
+				close(bothFoundNone)
+			}
+			if len(*seen) == 1 {
+				<-bothFoundNone // neither inserts before both have found no row
+			}
+			return nil
+		})
+	}
+	var seenA, seenB []*tables.TableWarpConfig
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = save(first, "a", &seenA) }()
+	go func() { defer wg.Done(); errs[1] = save(second, "b", &seenB) }()
+	wg.Wait()
+	require.NoError(t, errs[0])
+	require.NoError(t, errs[1])
+
+	winner, retried := seenA, seenB
+	other := "a"
+	if len(seenA) > len(seenB) {
+		winner, retried, other = seenB, seenA, "b"
+	}
+	require.Len(t, winner, 1)
+	require.Nil(t, winner[0])
+	require.Len(t, retried, 2, "the save that found the row taken merged again")
+	require.Nil(t, retried[0])
+	require.NotNil(t, retried[1])
+	require.Equal(t, other, retried[1].VectorStore, "from the row the other save wrote")
+	got, err := first.GetWarpConfig(ctx)
+	require.NoError(t, err)
+	require.NotEqual(t, other, got.VectorStore, "and its own write is the one stored")
 }

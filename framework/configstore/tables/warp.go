@@ -27,6 +27,12 @@ type TableWarpConfig struct {
 	APIKeyID string `gorm:"type:varchar(255)" json:"api_key_id,omitempty"`
 	// VirtualKeyID names a governance virtual key row; a reference, like APIKeyID.
 	VirtualKeyID string `gorm:"type:varchar(255);default:''" json:"virtual_key_id,omitempty"`
+	// VectorStore names the vector store, from config.json's, Warp's log index is kept in; "" is
+	// the primary vector_store.
+	VectorStore        string  `gorm:"type:varchar(64);default:''" json:"vector_store,omitempty"`
+	VectorStoreID      string  `gorm:"type:text;default:''" json:"-"`        // where that store keeps its data (vectorstore.NamedStore.ID) when it was chosen
+	VectorIndexID      string  `gorm:"type:varchar(32);default:''" json:"-"` // new each time the index moves to another store; "" if it never moved
+	VectorStoreCleanup *string `gorm:"type:text" json:"-"`                   // JSON list of the indexes left in stores the index moved away from, for upkeep to delete
 
 	// AdditionalModels is a JSON array of schemas.WarpModel, nil when there are none.
 	AdditionalModels *string `gorm:"type:text" json:"additional_models,omitempty"`

@@ -14,7 +14,7 @@ import { Switch } from "@/components/ui/switch";
 import { AutoSizeTextarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatWarpUsage } from "@/components/warp/warpStream.utils";
-import { getErrorMessage, useGetCoreConfigQuery } from "@/lib/store";
+import { getErrorMessage, useGetCoreConfigQuery, useGetVectorStoresQuery } from "@/lib/store";
 import { useGetProviderKeysQuery, useGetProvidersQuery } from "@/lib/store/apis/providersApi";
 import {
 	useCancelWarpBackfillMutation,
@@ -57,12 +57,22 @@ import WarpManagementToolsSection from "./warpManagementToolsSection";
 import WarpTopicsSection from "./warpTopicsSection";
 import {
 	isFiniteNumber,
+	resolveWarpVectorStoreName,
 	retainedWarpBackfillForSpace,
 	retainFinishedWarpBackfill,
+	showWarpVectorStorePicker,
 	validateWarpMaxIterations,
 	validateWarpRetentionDays,
 	warpSavedSpaceKey,
+	warpUnavailableMessage,
+	warpVectorStoreBadge,
+	warpVectorStoreChoice,
+	warpVectorStoreOptions,
+	warpVectorStorePayload,
+	warpVectorStoreSwitchPending,
+	warpVectorStoreUsable,
 	type RetainedWarpBackfill,
+	type WarpVectorStoreOptionStatus,
 } from "./warpView.utils";
 
 /**
@@ -120,6 +130,8 @@ interface WarpFormState {
 	discoveryMinRequests: number;
 	// Kinds of configuration change Warp may offer; empty is reads only.
 	managementWrites: WarpManagementWrite[];
+	// The configured store for the log index, by name; "" is the primary vector_store.
+	vectorStore: string;
 }
 
 const EMPTY_FORM: WarpFormState = {
@@ -141,6 +153,7 @@ const EMPTY_FORM: WarpFormState = {
 	searchLimit: DEFAULT_SEARCH_LIMIT,
 	discoveryMinRequests: DEFAULT_TOPIC_DISCOVERY_MIN_REQUESTS,
 	managementWrites: [],
+	vectorStore: "",
 };
 
 /**
@@ -158,6 +171,7 @@ const EMPTY_FORM: WarpFormState = {
  */
 export default function WarpView() {
 	const { t } = useTranslation("config");
+	const { t: tCommon } = useTranslation("common");
 	const hasWarpUpdateAccess = useRbac(RbacResource.Warp, RbacOperation.Update);
 	const { data: config, isLoading: isLoadingConfig, isError: isConfigError } = useGetWarpConfigQuery();
 	const {
@@ -172,6 +186,16 @@ export default function WarpView() {
 	const inferenceAuthEnforced = coreConfig?.client_config?.enforce_auth_on_inference ?? false;
 	const [startWarpBackfill, { isLoading: isStartingBackfill }] = useStartWarpBackfillMutation();
 	const [cancelWarpBackfill, { isLoading: isCancellingBackfill }] = useCancelWarpBackfillMutation();
+	// The configured vector stores Warp may keep its index in. A failed read
+	// leaves the list empty, which hides the picker and keeps the saved choice.
+	const {
+		data: vectorStoresData,
+		isError: vectorStoresFailed,
+		error: vectorStoresError,
+		refetch: refetchVectorStores,
+		isFetching: vectorStoresFetching,
+	} = useGetVectorStoresQuery();
+	const vectorStores = vectorStoresData?.vector_stores;
 
 	const [form, setForm] = useState<WarpFormState>(EMPTY_FORM);
 	const [activeBackfillID, setActiveBackfillID] = useState<string | null>(null);
@@ -376,6 +400,7 @@ export default function WarpView() {
 			searchLimit: config.semantic_search_limit || DEFAULT_SEARCH_LIMIT,
 			discoveryMinRequests: config.topic_discovery_min_requests || DEFAULT_TOPIC_DISCOVERY_MIN_REQUESTS,
 			managementWrites: config.management_writes ?? [],
+			vectorStore: config.vector_store ?? "",
 		});
 	}, [config]);
 
@@ -408,6 +433,8 @@ export default function WarpView() {
 	const updateModel = (id: string, patch: Partial<Omit<WarpModelRow, "id">>) =>
 		updateModels((models) => models.map((row) => (row.id === id ? { ...row, ...patch } : row)));
 
+	const savedVectorStore = config?.vector_store ?? "";
+	const vectorStoreSwitchPending = warpVectorStoreSwitchPending(form.vectorStore, savedVectorStore, vectorStores);
 	const hasChanges =
 		!!config &&
 		(form.enabled !== config.enabled ||
@@ -432,7 +459,26 @@ export default function WarpView() {
 			form.threshold !== (config.semantic_search_threshold || DEFAULT_SEARCH_THRESHOLD) ||
 			form.searchLimit !== (config.semantic_search_limit || DEFAULT_SEARCH_LIMIT) ||
 			form.discoveryMinRequests !== (config.topic_discovery_min_requests || DEFAULT_TOPIC_DISCOVERY_MIN_REQUESTS) ||
-			warpManagementWritesChanged(form.managementWrites, config.management_writes));
+			warpManagementWritesChanged(form.managementWrites, config.management_writes) ||
+			vectorStoreSwitchPending);
+
+	// While a switch is pending, whether Warp can be enabled depends on the picked store, not the current one.
+	const vectorStoreUsable = warpVectorStoreUsable(
+		config?.vector_store_connected ?? false,
+		form.vectorStore,
+		savedVectorStore,
+		vectorStores,
+	);
+	const vectorStoreBadge = warpVectorStoreBadge(config);
+	const vectorStoreOptions = warpVectorStoreOptions(vectorStores, savedVectorStore);
+	const vectorStoreStatusLabel = (status: WarpVectorStoreOptionStatus) =>
+		status === "failed"
+			? t("vectorStores.statusFailed")
+			: status === "disabled"
+				? t("vectorStores.statusDisabled")
+				: status === "missing"
+					? t("warp.vectorStoreMissing")
+					: t("vectorStores.statusConnected");
 
 	// The server enforces the same rules; checking here only saves a round trip.
 	const defaultModel = form.models[0];
@@ -456,7 +502,7 @@ export default function WarpView() {
 		form.discoveryMinRequests < MIN_TOPIC_DISCOVERY_MIN_REQUESTS ||
 		form.discoveryMinRequests > MAX_TOPIC_DISCOVERY_MIN_REQUESTS;
 	const embeddingFields: WarpEmbeddingFields = form;
-	const embeddingValidation = validateWarpEmbedding(embeddingFields, form.enabled, config?.vector_store_connected ?? false);
+	const embeddingValidation = validateWarpEmbedding(embeddingFields, form.enabled, vectorStoreUsable);
 	const savedEmbeddingFields: WarpEmbeddingFields = {
 		embeddingProvider: config?.embedding_provider ?? "",
 		embeddingModel: config?.embedding_model ?? "",
@@ -516,12 +562,14 @@ export default function WarpView() {
 			semantic_search_limit: form.searchLimit,
 			topic_discovery_min_requests: form.discoveryMinRequests,
 			management_writes: form.managementWrites,
+			...warpVectorStorePayload(form.vectorStore, savedVectorStore, vectorStores),
 		};
 		try {
 			await updateWarpConfig(payload).unwrap();
 			toast.success(t("warp.saved"));
 		} catch (error) {
-			toast.error(getErrorMessage(error));
+			// A 503 refusal (the chosen store is unavailable) carries {reason, message}, not {error: {message}}.
+			toast.error(warpUnavailableMessage(error) ?? getErrorMessage(error));
 		}
 	};
 
@@ -556,7 +604,7 @@ export default function WarpView() {
 			setActiveBackfillID(status.id ?? null);
 			toast.success(restart ? t("warp.backfillRestarted") : t("warp.backfillStarted"));
 		} catch (error) {
-			toast.error(getErrorMessage(error));
+			toast.error(warpUnavailableMessage(error) ?? getErrorMessage(error));
 		}
 	};
 
@@ -608,7 +656,7 @@ export default function WarpView() {
 									size="md"
 									data-testid="warp-enabled-switch"
 									checked={form.enabled}
-									disabled={!hasWarpUpdateAccess || (!config?.vector_store_connected && !form.enabled)}
+									disabled={!hasWarpUpdateAccess || (!vectorStoreUsable && !form.enabled)}
 									onCheckedChange={(checked) => update("enabled", checked)}
 								/>
 							</div>
@@ -620,7 +668,7 @@ export default function WarpView() {
 									{t("warp.disabledHint")}
 								</p>
 							)}
-							{!config?.vector_store_connected && (
+							{!vectorStoreUsable && (
 								<p className="text-destructive flex items-center gap-1.5 text-xs" data-testid="warp-vector-store-required">
 									<AlertTriangle className="h-3.5 w-3.5" /> {t("warp.vectorRequired")}
 								</p>
@@ -864,16 +912,87 @@ export default function WarpView() {
 							title={t("warp.conversationSearch")}
 							description={t("warp.conversationSearchHelp")}
 							action={
-								<Badge variant={config?.vector_store_connected ? "secondary" : "destructive"} data-testid="warp-vector-store-status">
-									{config?.vector_store_connected ? (
-										<CheckCircle2 className="mr-1 h-3.5 w-3.5" />
-									) : (
-										<Database className="mr-1 h-3.5 w-3.5" />
+								<Badge
+									variant={vectorStoreBadge.connected ? "secondary" : "destructive"}
+									// The server's reason can be a sentence, so it wraps instead of stretching the header.
+									className={cn(
+										!vectorStoreBadge.connected && vectorStoreBadge.error && "max-w-xs justify-start text-left whitespace-normal",
 									)}
-									{config?.vector_store_connected ? t("warp.vectorConnected") : t("warp.vectorDisconnected")}
+									data-testid="warp-vector-store-status"
+									data-vector-stores-loaded={vectorStoresData ? "true" : "false"}
+								>
+									{vectorStoreBadge.connected ? <CheckCircle2 className="mr-1 h-3.5 w-3.5" /> : <Database className="mr-1 h-3.5 w-3.5" />}
+									{vectorStoreBadge.connected
+										? vectorStoreBadge.name !== null
+											? t("warp.vectorConnectedTo", { name: vectorStoreBadge.name, type: vectorStoreBadge.type })
+											: t("warp.vectorConnected")
+										: (vectorStoreBadge.error ?? t("warp.vectorDisconnected"))}
 								</Badge>
 							}
 						>
+							{vectorStoresFailed && !vectorStoresData && (
+								// Without the list there is no picker; the saved choice is sent unchanged until it loads.
+								<Alert variant="destructive" data-testid="warp-vector-stores-load-error">
+									<AlertTriangle className="h-4 w-4" />
+									<AlertDescription className="flex flex-wrap items-center justify-between gap-2">
+										<span>
+											{t("vectorStores.loadError")} {getErrorMessage(vectorStoresError)}
+										</span>
+										<Button
+											type="button"
+											variant="outline"
+											size="sm"
+											onClick={() => refetchVectorStores()}
+											disabled={vectorStoresFetching}
+											data-testid="warp-vector-stores-retry"
+										>
+											{tCommon("retry")}
+										</Button>
+									</AlertDescription>
+								</Alert>
+							)}
+							{showWarpVectorStorePicker(vectorStores, savedVectorStore) && (
+								<div className="space-y-2">
+									<div className="grid gap-x-6 gap-y-5 md:grid-cols-2">
+										<WarpField label={t("warp.vectorStore")} htmlFor="warp-vector-store" hint={t("warp.vectorStoreHelp")}>
+											<Select
+												value={resolveWarpVectorStoreName(form.vectorStore, vectorStores)}
+												onValueChange={(name) => {
+													if (!name) return;
+													update("vectorStore", warpVectorStoreChoice(name, vectorStores));
+												}}
+												disabled={!hasWarpUpdateAccess}
+											>
+												<SelectTrigger className="w-full" id="warp-vector-store" data-testid="warp-vector-store-select">
+													<SelectValue placeholder={t("warp.selectVectorStore")} />
+												</SelectTrigger>
+												<SelectContent>
+													{vectorStoreOptions.map((option) => (
+														<SelectItem
+															key={option.name}
+															value={option.name}
+															disabled={!option.selectable}
+															disabledReason={option.selectable ? undefined : vectorStoreStatusLabel(option.status)}
+															title={option.error || undefined}
+															data-testid={`warp-vector-store-option-${option.name}`}
+														>
+															<span className="truncate">{option.name}</span>
+															{option.type && <span className="text-muted-foreground text-xs">{option.type}</span>}
+															{option.primary && <Badge variant="outline">{t("vectorStores.primary")}</Badge>}
+														</SelectItem>
+													))}
+												</SelectContent>
+											</Select>
+										</WarpField>
+									</div>
+									{vectorStoreSwitchPending && (
+										<p className="text-muted-foreground flex items-start gap-1.5 text-xs" data-testid="warp-vector-store-switch-note">
+											<Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+											{t("warp.vectorStoreSwitchNote", { name: resolveWarpVectorStoreName(form.vectorStore, vectorStores) })}
+										</p>
+									)}
+								</div>
+							)}
 							<div className="grid gap-x-6 gap-y-5 md:grid-cols-2">
 								<WarpField label={t("warp.embeddingProvider")} htmlFor="warp-embedding-provider">
 									<ProviderSelector

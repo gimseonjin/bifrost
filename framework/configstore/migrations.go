@@ -615,6 +615,7 @@ var configstoreMigrationSteps = []migrationStep{
 	{IDs: []string{"add_notification_subject_index"}, run: migrationAddNotificationSubjectIndex},
 	{IDs: []string{"add_governance_usage_reset_epochs"}, run: migrationAddGovernanceUsageResetEpochs},
 	{IDs: []string{"add_vector_store_settings_table"}, run: migrationAddVectorStoreSettingsTable},
+	{IDs: []string{"add_warp_vector_store_column"}, run: migrationAddWarpVectorStoreColumn},
 }
 
 // warpLogEmbeddingColumns are the semantic-search configuration columns added
@@ -17908,6 +17909,41 @@ func migrationAddWarpVirtualKeyIDColumn(ctx context.Context, db *gorm.DB, logger
 		Rollback: func(tx *gorm.DB) error {
 			// Reversible: without the column such a caller's calls carry no credential, as before.
 			return dropColumnIfExists(tx.WithContext(ctx), logger, &tables.TableWarpConfig{}, "virtual_key_id")
+		},
+	})
+}
+
+// migrationAddWarpVectorStoreColumn adds the vector store Warp's log index is kept in, by
+// its name in config.json and where that store keeps its data, the ID of the index built
+// there, and the indexes left in stores the index moved away from, which upkeep deletes.
+// Existing rows take "", the primary vector_store, which is where their index already is,
+// and nothing to delete.
+func migrationAddWarpVectorStoreColumn(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	migrationName := "add_warp_vector_store_column"
+	logger.Info("[configstore] starting migration %s", migrationName)
+	defer logger.Info("[configstore] finished migration %s", migrationName)
+	return RunSingleMigration(ctx, nil, db, logger, &migrator.Migration{
+		ID: migrationName,
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			if err := setMigrationLockTimeout(tx); err != nil {
+				return err
+			}
+			for _, column := range []string{"vector_store", "vector_store_id", "vector_index_id", "vector_store_cleanup"} {
+				if err := addColumnIfNotExists(tx, logger, &tables.TableWarpConfig{}, column); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			// Reversible: without the columns the index is in the primary store, as before.
+			for _, column := range []string{"vector_store_cleanup", "vector_index_id", "vector_store_id", "vector_store"} {
+				if err := dropColumnIfExists(tx.WithContext(ctx), logger, &tables.TableWarpConfig{}, column); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	})
 }

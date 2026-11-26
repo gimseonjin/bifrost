@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/bytedance/sonic"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -40,7 +41,13 @@ type ConfigView struct {
 	// TopicDiscoveryMinRequests is how many requests that matched no topic
 	// start a discovery.
 	TopicDiscoveryMinRequests int  `json:"topic_discovery_min_requests"`
-	VectorStoreConnected      bool `json:"vector_store_connected"`
+	VectorStoreConnected      bool `json:"vector_store_connected"` // ConnectedVectorStore is not nil
+	// VectorStore is the configured store Warp's log index is kept in, by name; "" is the
+	// primary vector_store. ConnectedVectorStore is that store while Warp can use it, nil
+	// when it has none, and VectorStoreError then says why when there is more to say.
+	VectorStore          string                `json:"vector_store"`
+	ConnectedVectorStore *ConnectedVectorStore `json:"connected_vector_store"`
+	VectorStoreError     string                `json:"vector_store_error,omitempty"`
 	// ManagementWrites are the kinds of change Warp may offer; empty is reads only.
 	ManagementWrites []string `json:"management_writes"`
 	// ManagementWritesAvailable is whether the Bifrost MCP serves writes at all
@@ -91,6 +98,9 @@ type ConfigInput struct {
 	// ManagementWrites are the kinds of change Warp may offer, from
 	// schemas.WarpManagementWrites. Omitted keeps the stored value; [] is reads only.
 	ManagementWrites []string `json:"management_writes,omitempty"`
+	// VectorStore names the configured store to keep the log index in. Omitted keeps the
+	// stored value; "" is the primary vector_store.
+	VectorStore string `json:"vector_store,omitempty"`
 
 	// present records the keys the decoded request carried. See UnmarshalJSON.
 	present map[string]bool
@@ -155,6 +165,8 @@ func (c *ConfigInput) supplied(field string) bool {
 		return c.ManagementWrites != nil
 	case "virtual_key_id":
 		return c.VirtualKeyID != ""
+	case "vector_store":
+		return c.VectorStore != ""
 	}
 	return false
 }
@@ -206,6 +218,9 @@ func applyStoredEmbeddingSettings(input *ConfigInput, previous *tables.TableWarp
 	if !input.supplied("virtual_key_id") {
 		input.VirtualKeyID = previous.VirtualKeyID
 	}
+	if !input.supplied("vector_store") {
+		input.VectorStore = previous.VectorStore
+	}
 }
 
 // ConfigView returns the stored configuration for display.
@@ -224,7 +239,7 @@ func (s *Service) ConfigView(ctx context.Context) (ConfigView, error) {
 	}
 	if row == nil {
 		_, catalog := s.managementTools()
-		return ConfigView{
+		view := ConfigView{
 			MaxIterations:             schemas.WarpDefaultMaxIterations,
 			RequestTimeoutSeconds:     schemas.WarpDefaultRequestTimeoutSeconds,
 			HistoryRetentionDays:      schemas.WarpDefaultHistoryRetentionDays,
@@ -232,13 +247,14 @@ func (s *Service) ConfigView(ctx context.Context) (ConfigView, error) {
 			SemanticSearchThreshold:   schemas.WarpDefaultSemanticSearchThreshold,
 			SemanticSearchLimit:       schemas.WarpDefaultSemanticSearchLimit,
 			TopicDiscoveryMinRequests: schemas.WarpDefaultTopicDiscoveryMinRequests,
-			VectorStoreConnected:      s.vectorStore != nil,
 			ManagementWrites:          []string{},
 			ManagementWritesAvailable: catalog.hasWrites(),
 			ManagementToolSizes:       catalog.sizes(),
 			BifrostMCPAvailable:       s.bifrostMCPAvailable(),
 			BifrostMCPEnabled:         s.bifrostMCP,
-		}, nil
+		}
+		view.VectorStoreConnected, view.ConnectedVectorStore, view.VectorStoreError = s.vectorStoreStatus(s.rowSelection(nil))
+		return view, nil
 	}
 	return s.configViewFromRow(row), nil
 }
@@ -268,7 +284,38 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 			return ConfigView{}, err
 		}
 	}
-	if input.Enabled && s.vectorStore == nil {
+	// The store the index is to be kept in: a name config.json does not configure is refused,
+	// and so is changing to one that is not connected, since nothing could be indexed there.
+	// Only a new choice is checked against config.json: a stored one that is no longer
+	// usable must not block saving other settings, or turning Warp off.
+	previousStore := ""
+	if previous != nil {
+		previousStore = previous.VectorStore
+	}
+	input.VectorStore = strings.TrimSpace(input.VectorStore)
+	target := s.resolveSelection(input.VectorStore)
+	if input.VectorStore != previousStore {
+		if target, err = s.targetVectorStore(input.VectorStore); err != nil {
+			return ConfigView{}, err
+		}
+		if s.vectorSlot != nil && target.store() == nil {
+			return ConfigView{}, fmt.Errorf("%w: %v", ErrInvalidConfig, unavailableVectorStore(target))
+		}
+	}
+	// A move to a store holding other data starts a new index there and leaves the old one for
+	// upkeep to delete. A store renamed in config.json holds the same data and is not a move.
+	move := vectorStoreMove{moves: s.indexMoves(previous, target), at: time.Now()}
+	if move.moves {
+		move.indexID = newVectorIndexID()
+	}
+	vectors := s.vectorStore
+	if s.vectorSlot != nil {
+		vectors = target.store()
+	}
+	if input.Enabled && vectors == nil {
+		if s.vectorSlot != nil {
+			return ConfigView{}, unavailableVectorStore(target)
+		}
 		return ConfigView{}, ErrNoVectorStore
 	}
 	// Everything that can reject the save happens before anything is created in
@@ -288,13 +335,19 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 		normalizedNamespace(previous.LogVectorStoreNamespace) == normalizedNamespace(input.LogVectorStoreNamespace) {
 		return ConfigView{}, fmt.Errorf("%w: log_vector_store_namespace must change when the embedding provider, model or dimension changes", ErrInvalidConfig)
 	}
-	if embeddingSpaceChanged(previous, input) && s.backfillJobs != nil {
-		active, activeErr := s.backfillJobs.GetInFlightSidekiqJobByKind(ctx, BackfillJobKind)
-		if activeErr != nil {
-			return ConfigView{}, activeErr
-		}
-		if active != nil {
-			return ConfigView{}, ErrBackfillInProgress
+	// A backfill writes into the index it started in, under the embedding space it froze, and
+	// a move or a new embedding space ends that index: neither is saved while one runs. The
+	// admission lock is held to the write, so no backfill is admitted here in between.
+	if move.moves || embeddingSpaceChanged(previous, input) {
+		defer s.LockBackfillAdmission()()
+		if s.backfillJobs != nil {
+			active, activeErr := s.backfillJobs.GetInFlightSidekiqJobByKind(ctx, BackfillJobKind)
+			if activeErr != nil {
+				return ConfigView{}, activeErr
+			}
+			if active != nil {
+				return ConfigView{}, ErrBackfillInProgress
+			}
 		}
 	}
 	// Retire what was actually in use. A blank stored value means the default
@@ -304,6 +357,13 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 	if embeddingSpaceChanged(previous, input) {
 		retired = appendUnique(retired, normalizedNamespace(previous.LogVectorStoreNamespace))
 	}
+	if move.moves {
+		// Back into a store the index left, under the namespace it had there: that index is
+		// deleted first, enabled or not, so the new one starts empty.
+		if err := s.clearIndexReturnedTo(ctx, previous, target, normalizedNamespace(input.LogVectorStoreNamespace)); err != nil {
+			return ConfigView{}, err
+		}
+	}
 	if input.Enabled {
 		// Still ahead of the write: a namespace that cannot be created is a save
 		// that cannot work, and the config must not claim otherwise.
@@ -312,7 +372,7 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 		// failing write can undo only its own work. A namespace that already
 		// existed may hold vectors a previous configuration still indexes and is
 		// never touched.
-		created, err := ensureWarpNamespace(ctx, s.vectorStore, input.LogVectorStoreNamespace, input.EmbeddingDimension)
+		created, err := ensureWarpNamespace(ctx, vectors, input.LogVectorStoreNamespace, input.EmbeddingDimension)
 		if err != nil {
 			return ConfigView{}, fmt.Errorf("ensure warp vector namespace: %w", err)
 		}
@@ -348,6 +408,13 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 		SemanticSearchThreshold:   input.SemanticSearchThreshold,
 		SemanticSearchLimit:       input.SemanticSearchLimit,
 		TopicDiscoveryMinRequests: input.TopicDiscoveryMinRequests,
+		VectorStore:               input.VectorStore,
+	}
+	switch {
+	case target.entry != nil:
+		row.VectorStoreID = target.entry.ID
+	case previous != nil && input.VectorStore == previousStore:
+		row.VectorStoreID = previous.VectorStoreID // a stored choice that is not configured now keeps where it was
 	}
 	if len(input.ManagementWrites) > 0 {
 		encoded, err := sonic.MarshalString(input.ManagementWrites)
@@ -363,7 +430,7 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 	if input.SystemPromptSuffix != "" {
 		row.SystemPromptSuffix = &input.SystemPromptSuffix
 	}
-	if err := s.store.UpsertWarpConfig(ctx, row); err != nil {
+	if err := s.upsertWarpRow(ctx, row, s.mergeSave(row, previous, move)); err != nil {
 		// Compensate: the namespace this save created is empty and no stored
 		// config points at it, so leaving it behind is a leak that the next save
 		// under a different name never reclaims. Only the one created here - a
@@ -373,13 +440,14 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 		// our create would lose it here. That window is narrower than the
 		// unconditional leak it replaces, and both saves are the same operator
 		// action on one settings page.
-		if createdNamespace != "" && s.vectorStore != nil {
-			if cleanupErr := s.vectorStore.DeleteNamespace(ctx, createdNamespace); cleanupErr != nil {
+		if createdNamespace != "" && vectors != nil {
+			if cleanupErr := vectors.DeleteNamespace(ctx, createdNamespace); cleanupErr != nil {
 				s.warnf("failed to remove warp vector namespace %s after a failed config save: %v", createdNamespace, cleanupErr)
 			}
 		}
 		return ConfigView{}, err
 	}
+	s.followVectorStore(row)
 	return s.configViewFromRow(row), nil
 }
 
@@ -667,11 +735,14 @@ func (s *Service) configViewFromRow(row *tables.TableWarpConfig) ConfigView {
 		SemanticSearchThreshold:   config.EffectiveSemanticSearchThreshold(),
 		SemanticSearchLimit:       config.EffectiveSemanticSearchLimit(),
 		TopicDiscoveryMinRequests: config.EffectiveTopicDiscoveryMinRequests(),
-		VectorStoreConnected:      s.vectorStore != nil,
+		VectorStore:               row.VectorStore,
 		ManagementWrites:          nonNilStrings(config.ManagementWrites),
 		BifrostMCPAvailable:       s.bifrostMCPAvailable(),
 		BifrostMCPEnabled:         s.bifrostMCP,
 	}
+	// From the same row: the store the view names is the one whose status it shows, whatever
+	// another save has moved the index to since.
+	view.VectorStoreConnected, view.ConnectedVectorStore, view.VectorStoreError = s.vectorStoreStatus(s.rowSelection(row))
 	_, catalog := s.managementTools()
 	view.ManagementWritesAvailable = catalog.hasWrites()
 	view.ManagementToolSizes = catalog.sizes()

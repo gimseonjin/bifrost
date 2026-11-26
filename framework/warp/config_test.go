@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"github.com/bytedance/sonic"
+	"github.com/maximhq/bifrost/framework/vectorstore"
+	"github.com/stretchr/testify/assert"
 	"testing"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -906,4 +908,185 @@ func TestWarpVirtualKeyIsConfigurable(t *testing.T) {
 		_, err := service.SaveConfig(context.Background(), inputFromJSON(t, `{`+base+`, "virtual_key_id": "`+id+`"}`))
 		require.ErrorIs(t, err, ErrInvalidConfig, name)
 	}
+}
+
+// fakeVectorStores resolves the stores a test configures: primary is the
+// top-level vector_store, named the others.
+type fakeVectorStores struct {
+	primary *vectorstore.NamedStore
+	named   []*vectorstore.NamedStore
+}
+
+func (f *fakeVectorStores) Primary() *vectorstore.NamedStore { return f.primary }
+
+func (f *fakeVectorStores) All() []*vectorstore.NamedStore {
+	if f.primary == nil {
+		return append([]*vectorstore.NamedStore(nil), f.named...)
+	}
+	return append([]*vectorstore.NamedStore{f.primary}, f.named...)
+}
+
+func (f *fakeVectorStores) Get(name string) (*vectorstore.NamedStore, bool) {
+	for _, entry := range append([]*vectorstore.NamedStore{f.primary}, f.named...) {
+		if entry != nil && entry.Name == name {
+			return entry, true
+		}
+	}
+	return nil, false
+}
+
+// warpStoresForTest is a primary store "shared", a second connected store
+// "warp-qdrant", one that failed at startup and one that is disabled.
+func warpStoresForTest() (*fakeVectorStores, *fakeWarpVectorStore, *fakeWarpVectorStore) {
+	shared, qdrant := newFakeWarpVectorStore(), newFakeWarpVectorStore()
+	return &fakeVectorStores{
+		primary: &vectorstore.NamedStore{Name: "shared", Type: "weaviate", ID: "weaviate+http://shared", Primary: true, Status: vectorstore.StoreConnected, Store: shared},
+		named: []*vectorstore.NamedStore{
+			{Name: "warp-qdrant", Type: "qdrant", ID: "qdrant://warp:6334", Status: vectorstore.StoreConnected, Store: qdrant},
+			{Name: "down", Type: "redis", ID: "redis://down:6379/0", Status: vectorstore.StoreFailed, Err: errors.New("connection refused")},
+			{Name: "off", Type: "qdrant", ID: "qdrant://off:6334", Status: vectorstore.StoreDisabled},
+		},
+	}, shared, qdrant
+}
+
+// Warp keeps its index in the store its settings name, the primary one until
+// they name another. A move provisions the namespace in the new store, starts a
+// new index there, leaves the old index for upkeep to delete, and an omitted
+// choice keeps the stored one. A store that is not configured, or not
+// connected, is refused; going back to the primary leaves the qdrant index too.
+func TestWarpChoosesTheVectorStoreItsIndexIsKeptIn(t *testing.T) {
+	ctx := context.Background()
+	stores, shared, qdrant := warpStoresForTest()
+	store := &recordingStore{}
+	service := serviceForTest(t, nil, WithConfigStore(store), WithVectorStores(stores))
+
+	view, err := service.SaveConfig(ctx, validWarpConfigInput())
+	require.NoError(t, err)
+	assert.Empty(t, view.VectorStore, "the primary store until another is chosen")
+	require.NotNil(t, view.ConnectedVectorStore)
+	assert.Equal(t, ConnectedVectorStore{Name: "shared", Type: "weaviate", Primary: true}, *view.ConnectedVectorStore)
+	assert.True(t, view.VectorStoreConnected)
+	assert.Contains(t, shared.created, schemas.WarpDefaultLogVectorStoreNamespace)
+	shared.existing = []string{schemas.WarpDefaultLogVectorStoreNamespace} // listed from now on, as a real store lists what it created
+
+	moved := validWarpConfigInput()
+	moved.VectorStore = "warp-qdrant"
+	view, err = service.SaveConfig(ctx, moved)
+	require.NoError(t, err)
+	assert.Equal(t, "warp-qdrant", view.VectorStore)
+	assert.Equal(t, "warp-qdrant", view.ConnectedVectorStore.Name)
+	assert.Contains(t, qdrant.created, schemas.WarpDefaultLogVectorStoreNamespace, "the namespace is provisioned in the new store")
+	assert.Same(t, qdrant, service.currentVectorStore(), "the index is kept there from now on")
+	firstMove := store.row.VectorIndexID
+	assert.NotEmpty(t, firstMove, "a new index")
+	assert.Equal(t, "qdrant://warp:6334", store.row.VectorStoreID)
+	left := pendingCleanups(store.row)
+	require.Len(t, left, 1, "the index in the primary store is left for upkeep to delete")
+	assert.Equal(t, "shared", left[0].Store)
+	assert.Equal(t, "weaviate+http://shared", left[0].StoreID)
+	assert.Equal(t, schemas.WarpDefaultLogVectorStoreNamespace, left[0].Namespace)
+	assert.Equal(t, 1536, left[0].Dimension)
+
+	view, err = service.SaveConfig(ctx, inputFromJSON(t, `{"enabled": true, "provider": "openai", "model": "gpt-4o"}`))
+	require.NoError(t, err)
+	assert.Equal(t, "warp-qdrant", view.VectorStore, "an omitted choice keeps the stored one")
+	assert.Equal(t, firstMove, store.row.VectorIndexID, "and the index built there")
+	assert.Len(t, pendingCleanups(store.row), 1, "a save that does not move leaves the list as it was")
+
+	for name, wantErr := range map[string]string{
+		"nobody": `vector_store "nobody" is not configured in config.json`,
+		"down":   `Warp's vector store "down" could not be reached at startup`,
+		"off":    `Warp's vector store "off" is disabled in config.json`,
+	} {
+		refused := validWarpConfigInput()
+		refused.VectorStore = name
+		_, err := service.SaveConfig(ctx, refused)
+		require.ErrorIs(t, err, ErrInvalidConfig, name)
+		assert.ErrorContains(t, err, wantErr)
+	}
+	assert.Equal(t, "warp-qdrant", store.row.VectorStore, "a refused choice changes nothing")
+
+	back := inputFromJSON(t, `{"enabled": true, "provider": "openai", "model": "gpt-4o", "vector_store": ""}`)
+	view, err = service.SaveConfig(ctx, back)
+	require.NoError(t, err)
+	assert.Empty(t, view.VectorStore, `"" chooses the primary store`)
+	assert.Same(t, shared, service.currentVectorStore())
+	assert.NotEqual(t, firstMove, store.row.VectorIndexID, "each move starts a new index")
+	left = pendingCleanups(store.row)
+	require.Len(t, left, 1, "the index the primary store had is deleted on the way back, and the qdrant one is left")
+	assert.Equal(t, "qdrant://warp:6334", left[0].StoreID)
+	assert.Contains(t, shared.deleted, schemas.WarpDefaultLogVectorStoreNamespace, "the old primary index is deleted before it is used again")
+}
+
+// A choice saved on one node reaches another with its next read of the
+// configuration, as every other Warp setting does.
+func TestWarpFollowsAVectorStoreChosenOnAnotherNode(t *testing.T) {
+	ctx := context.Background()
+	stores, shared, qdrant := warpStoresForTest()
+	store := &recordingStore{}
+	here := serviceForTest(t, nil, WithConfigStore(store), WithVectorStores(stores))
+	there := serviceForTest(t, nil, WithConfigStore(store), WithVectorStores(stores))
+	_, err := here.SaveConfig(ctx, validWarpConfigInput())
+	require.NoError(t, err)
+	require.Same(t, shared, there.currentVectorStore())
+
+	moved := validWarpConfigInput()
+	moved.VectorStore = "warp-qdrant"
+	_, err = here.SaveConfig(ctx, moved)
+	require.NoError(t, err)
+	_, err = there.Config(ctx)
+	require.NoError(t, err)
+	assert.Same(t, qdrant, there.currentVectorStore(), "the other node moved on its next read")
+}
+
+// A store chosen earlier that is no longer usable (removed from config.json, or
+// unreachable at startup) leaves Warp with no store, never another one: the view
+// says why, semantic search is withdrawn, logs are not queued, and enabling
+// Warp says which store to fix. Turning Warp off is still allowed.
+func TestWarpWithAnUnusableVectorStoreChoiceIsUnavailable(t *testing.T) {
+	ctx := context.Background()
+	stores, _, _ := warpStoresForTest()
+	for name, want := range map[string]string{
+		"down":    `Warp's vector store "down" could not be reached at startup`,
+		"removed": `Warp's vector store "removed" is not configured in config.json`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			row := validWarpConfigRow()
+			row.VectorStore = name
+			service := serviceForTest(t, nil, WithConfigStore(&recordingStore{row: row}), WithVectorStores(stores),
+				WithEmbeddingExecutor(backfillEmbeddingExecutor), WithLogReader(&backfillLogReader{}))
+
+			view, err := service.ConfigView(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, name, view.VectorStore)
+			assert.Nil(t, view.ConnectedVectorStore)
+			assert.False(t, view.VectorStoreConnected)
+			assert.Equal(t, want, view.VectorStoreError)
+			assert.Nil(t, service.currentVectorStore(), "no other store stands in")
+			_, semantic := service.researchDeps()
+			assert.Nil(t, semantic, "no semantic search without the store")
+
+			_, err = service.SaveConfig(ctx, inputFromJSON(t, `{"enabled": true, "provider": "openai", "model": "gpt-4o"}`))
+			require.ErrorIs(t, err, ErrNoVectorStore)
+			var unavailable *VectorStoreUnavailableError
+			require.ErrorAs(t, err, &unavailable)
+			assert.Equal(t, name, unavailable.Name)
+
+			_, err = service.SaveConfig(ctx, inputFromJSON(t, `{"enabled": false, "provider": "openai", "model": "gpt-4o"}`))
+			require.NoError(t, err, "the stored choice does not block turning Warp off")
+		})
+	}
+}
+
+// The index does not move while a backfill writes into the store it started
+// in: the move is refused until the run ends.
+func TestWarpVectorStoreMoveWaitsForABackfill(t *testing.T) {
+	ctx := context.Background()
+	stores, _, _ := warpStoresForTest()
+	running := activeBackfillStore{active: &tables.TableSidekiqJob{ID: "running", Kind: BackfillJobKind, Status: tables.SidekiqStatusRunning}}
+	service := serviceForTest(t, nil, WithConfigStore(&recordingStore{row: validWarpConfigRow()}), WithVectorStores(stores), WithBackfillJobStore(running))
+	moved := validWarpConfigInput()
+	moved.VectorStore = "warp-qdrant"
+	_, err := service.SaveConfig(ctx, moved)
+	require.ErrorIs(t, err, ErrBackfillInProgress)
 }

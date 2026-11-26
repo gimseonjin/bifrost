@@ -1,5 +1,6 @@
 import i18n from "@/lib/i18n";
-import type { WarpBackfillJob, WarpConfig } from "@/lib/types/warp";
+import type { VectorStoreInfo, VectorStoreStatus } from "@/lib/types/config";
+import type { WarpBackfillJob, WarpConfig, WarpConfigInput } from "@/lib/types/warp";
 /**
  * Validation helpers for the Warp settings form.
  *
@@ -66,12 +67,16 @@ export function validateWarpMaxIterations(value: unknown): true | string {
 
 /**
  * The saved embedding space as one comparable string, so "did the space
- * change" is a single equality on the four fields that define it. Uses NUL as
- * the separator because it cannot appear in a config value.
+ * change" is a single equality on the fields that define it. The chosen vector
+ * store is one of them: a store switched to starts empty, so a run finished in
+ * the old store says nothing about the new one. Uses NUL as the separator
+ * because it cannot appear in a config value.
  */
 export function warpSavedSpaceKey(
 	config:
-		| Partial<Pick<WarpConfig, "embedding_provider" | "embedding_model" | "embedding_dimension" | "log_vector_store_namespace">>
+		| Partial<
+				Pick<WarpConfig, "embedding_provider" | "embedding_model" | "embedding_dimension" | "log_vector_store_namespace" | "vector_store">
+		  >
 		| undefined,
 ): string {
 	return [
@@ -79,6 +84,7 @@ export function warpSavedSpaceKey(
 		config?.embedding_model ?? "",
 		config?.embedding_dimension ?? 0,
 		config?.log_vector_store_namespace ?? "",
+		config?.vector_store ?? "",
 	].join("\u0000");
 }
 
@@ -119,4 +125,127 @@ export function retainFinishedWarpBackfill(
  */
 export function retainedWarpBackfillForSpace(retained: RetainedWarpBackfill | null, savedSpaceKey: string): WarpBackfillJob | null {
 	return retained && retained.spaceKey === savedSpaceKey ? retained.job : null;
+}
+type VectorStoreList = readonly VectorStoreInfo[] | undefined;
+
+/** The vector store picker is shown only when there is a choice to make: more than one configured store. */
+export function showWarpVectorStorePicker(stores: VectorStoreList, savedChoice = ""): boolean {
+	if ((stores?.length ?? 0) > 1) return true;
+	// One store, but the saved choice does not reach it (a store removed from config.json, or
+	// "" with no primary store): the picker is the way to choose the one that is left.
+	const sole = stores?.[0];
+	return !!sole && sole.status === "connected" && resolveWarpVectorStoreName(savedChoice, stores) !== sole.name;
+}
+
+/**
+ * The store a stored choice names. "" is the primary vector_store, so it
+ * resolves to the primary's name, or "" when no primary is configured.
+ */
+export function resolveWarpVectorStoreName(choice: string, stores: VectorStoreList): string {
+	if (choice) return choice;
+	return stores?.find((store) => store.primary)?.name ?? "";
+}
+
+/** The choice to store for a store picked by name: the primary is stored as "", any other store by its name. */
+export function warpVectorStoreChoice(name: string, stores: VectorStoreList): string {
+	return stores?.some((store) => store.primary && store.name === name) ? "" : name;
+}
+
+/**
+ * Whether the form picks a different store from the saved one. Compared by the
+ * store each choice resolves to, so a saved choice that names the primary
+ * explicitly and the form's "" are the same store, not a pending switch.
+ */
+export function warpVectorStoreSwitchPending(choice: string, savedChoice: string, stores: VectorStoreList): boolean {
+	return resolveWarpVectorStoreName(choice, stores) !== resolveWarpVectorStoreName(savedChoice, stores);
+}
+
+/**
+ * The vector_store part of the save body. Sent only for a switch: an omitted
+ * field keeps the stored choice, so a save that did not touch the picker (or
+ * ran before the store list loaded) can never move Warp to another store.
+ */
+export function warpVectorStorePayload(
+	choice: string,
+	savedChoice: string,
+	stores: VectorStoreList,
+): Pick<WarpConfigInput, "vector_store"> {
+	if (!warpVectorStoreSwitchPending(choice, savedChoice, stores)) return {};
+	return { vector_store: warpVectorStoreChoice(resolveWarpVectorStoreName(choice, stores), stores) };
+}
+
+/** "missing" is a saved choice no longer configured in config.json. */
+export type WarpVectorStoreOptionStatus = VectorStoreStatus | "missing";
+
+export interface WarpVectorStoreOption {
+	name: string;
+	type: string;
+	primary: boolean;
+	status: WarpVectorStoreOptionStatus;
+	error: string;
+	selectable: boolean;
+}
+
+/**
+ * The picker's options: every configured store, selectable only while
+ * connected, since the server refuses a switch to a store it cannot reach. A
+ * saved choice that is no longer configured is kept as an unselectable option,
+ * so the picker shows what is saved instead of going blank.
+ */
+export function warpVectorStoreOptions(stores: VectorStoreList, savedChoice: string): WarpVectorStoreOption[] {
+	const options: WarpVectorStoreOption[] = (stores ?? []).map((store) => ({
+		name: store.name,
+		type: store.type,
+		primary: store.primary,
+		status: store.status,
+		error: store.error,
+		selectable: store.status === "connected",
+	}));
+	if (savedChoice && !options.some((option) => option.name === savedChoice)) {
+		options.push({ name: savedChoice, type: "", primary: false, status: "missing", error: "", selectable: false });
+	}
+	return options;
+}
+
+/**
+ * Whether Warp will have a store it can use once the form is saved: what the
+ * server reports while the saved store stays, or whether the picked store is
+ * connected while a switch is pending.
+ */
+export function warpVectorStoreUsable(connected: boolean, choice: string, savedChoice: string, stores: VectorStoreList): boolean {
+	if (!warpVectorStoreSwitchPending(choice, savedChoice, stores)) return connected;
+	const name = resolveWarpVectorStoreName(choice, stores);
+	return stores?.some((store) => store.name === name && store.status === "connected") ?? false;
+}
+
+export type WarpVectorStoreBadge =
+	| { connected: true; name: string; type: string }
+	| { connected: true; name: null; type: null }
+	| { connected: false; error: string | null };
+
+/**
+ * What the status badge says. A config without connected_vector_store (a
+ * server older than the store choice) still reports vector_store_connected,
+ * so that is the fallback, shown without a name.
+ */
+export function warpVectorStoreBadge(
+	config: Partial<Pick<WarpConfig, "vector_store_connected" | "connected_vector_store" | "vector_store_error">> | undefined,
+): WarpVectorStoreBadge {
+	const store = config?.connected_vector_store;
+	if (store) return { connected: true, name: store.name, type: store.type };
+	if (config?.vector_store_connected && store === undefined) return { connected: true, name: null, type: null };
+	return { connected: false, error: config?.vector_store_error || null };
+}
+
+/**
+ * The message of a 503 save refusal, whose body is `{reason, message}` rather
+ * than the `{error: {message}}` shape getErrorMessage reads (e.g. saving an
+ * enabled Warp while the chosen store is unavailable). Null for any other error.
+ */
+export function warpUnavailableMessage(error: unknown): string | null {
+	if (!error || typeof error !== "object" || !("data" in error)) return null;
+	const data = (error as { data?: unknown }).data;
+	if (!data || typeof data !== "object" || !("reason" in data) || !("message" in data)) return null;
+	const message = (data as { message?: unknown }).message;
+	return typeof message === "string" && message ? message : null;
 }

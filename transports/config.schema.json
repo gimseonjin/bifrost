@@ -6434,6 +6434,12 @@
           "default": "BifrostWarpLogs",
           "description": "Vector store namespace holding Warp's log index. Must change whenever embedding_provider, embedding_model or embedding_dimension changes."
         },
+        "vector_store": {
+          "type": "string",
+          "pattern": "^([A-Za-z0-9][A-Za-z0-9._-]{0,63})?$",
+          "default": "",
+          "description": "The configured vector store Warp's log index is kept in, by its name (vector_store's or a vector_stores entry's). Omit or \"\" for the primary vector_store. A store that is not configured, or not connected at startup, refuses the save; a store chosen earlier that becomes unavailable leaves Warp unavailable rather than using another. Moving the index leaves the new store empty until a backfill runs (Settings > Warp), and keeps the vectors already in the old store, which still follow log deletes and retention."
+        },
         "semantic_search_threshold": {
           "type": "number",
           "minimum": 0,

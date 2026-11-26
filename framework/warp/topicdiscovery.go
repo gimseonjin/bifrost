@@ -1254,6 +1254,12 @@ func (s *Service) topicUpkeepTick(ctx context.Context) {
 	} else if swept > 0 {
 		s.infof("warp: swept %d vector(s) of expired logs", swept)
 	}
+	// Every node runs it; deleting an index that is already gone does nothing.
+	if deleted, err := s.deleteLeftIndexes(ctx, time.Now().UTC()); err != nil {
+		s.warnf("failed to delete the log index Warp moved away from (%d deleted this pass); upkeep will retry: %v", deleted, err)
+	} else if deleted > 0 {
+		s.infof("warp: deleted %d log index(es) left in vector stores Warp moved away from", deleted)
+	}
 	started, err := s.StartDiscoveryIfDue(ctx)
 	if err != nil {
 		s.warnf("failed to start Warp topic discovery: %v", err)

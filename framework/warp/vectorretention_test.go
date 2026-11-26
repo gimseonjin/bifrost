@@ -11,6 +11,7 @@ import (
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/vectorstore"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -75,7 +76,7 @@ func TestWarpSweepsVectorsOfExpiredLogs(t *testing.T) {
 	require.Len(t, vectors.adds, 2)
 
 	days := 0
-	service.SetVectorRetention(func() int { return days })
+	service.SetVectorRetention(func(string) int { return days })
 	swept, err = service.sweepExpiredVectors(context.Background(), now)
 	require.NoError(t, err)
 	require.Zero(t, swept, "a retention of zero keeps everything")
@@ -100,14 +101,14 @@ func TestWarpSweepsVectorsOfExpiredLogs(t *testing.T) {
 // nothing, and is skipped without a word.
 func TestWarpSweepsExpiredVectorsWhileWarpIsDisabled(t *testing.T) {
 	service, vectors := retentionTestService(t)
-	service.SetVectorRetention(func() int { return 30 })
+	service.SetVectorRetention(func(string) int { return 30 })
 	service.store.(*recordingStore).row.Enabled = false
 	service.topicUpkeepTick(context.Background())
 	require.Equal(t, []string{"fresh"}, retentionTestIDs(vectors))
 
 	never := serviceForTest(t, nil, WithConfigStore(&recordingStore{}), WithVectorStore(newFakeWarpVectorStore()))
 	t.Cleanup(never.Shutdown)
-	never.SetVectorRetention(func() int { return 30 })
+	never.SetVectorRetention(func(string) int { return 30 })
 	swept, err := never.sweepExpiredVectors(context.Background(), time.Now().UTC())
 	require.NoError(t, err)
 	require.Zero(t, swept)
@@ -221,7 +222,7 @@ func TestWarpForgetLogsRecordsNothingWithoutAnEmbeddingModel(t *testing.T) {
 func TestWarpSweepSurvivesARetentionTooLongForADuration(t *testing.T) {
 	service, vectors := retentionTestService(t)
 	for _, days := range []int{106752, 200000, math.MaxInt} {
-		service.SetVectorRetention(func() int { return days })
+		service.SetVectorRetention(func(string) int { return days })
 		swept, err := service.sweepExpiredVectors(context.Background(), time.Now().UTC())
 		require.NoError(t, err)
 		require.Zero(t, swept, "days=%d", days)
@@ -273,4 +274,54 @@ func TestWarpOpensItsLogIndexForTheVectorStorageLimitAfterARestart(t *testing.T)
 	count, err := indexes[0].Store.CountVectors(ctx, indexes[0].Namespace, indexes[0].Filter)
 	require.NoError(t, err, "the reopened namespace can be counted")
 	require.EqualValues(t, 3, count)
+}
+
+// After Warp's index moves, a deleted log's vector, retention and the storage
+// limit reach only the store the index is in now, under that store's
+// retention: the index it left is deleted whole by upkeep, not log by log.
+func TestWarpVectorsFollowLogsInTheStoreTheIndexIsIn(t *testing.T) {
+	ctx := context.Background()
+	stores, shared, qdrant := warpStoresForTest()
+	row := assignTestRow()
+	service := serviceForTest(t, nil,
+		WithConfigStore(&recordingStore{row: row}), WithLogReader(topicTestReader(t, map[string]logstore.Log{})),
+		WithVectorStores(stores), WithEmbeddingExecutor(assignTestEmbedding),
+	)
+	now := time.Now().UTC()
+	index := func(id string, at time.Time) {
+		t.Helper()
+		outcome, err := service.indexer.Index(ctx, &logstore.Log{
+			ID: id, Timestamp: at, Object: string(schemas.ChatCompletionRequest), Status: "success",
+			InputHistoryParsed: []schemas.ChatMessage{chatTurn(schemas.ChatMessageRoleUser, "how do I get a refund")},
+		})
+		require.NoError(t, err)
+		require.Equal(t, IndexOutcomeIndexed, outcome)
+	}
+	index("old-fresh", now.Add(-time.Hour))
+	index("old-stale", now.Add(-365*24*time.Hour))
+	row.VectorStore = "warp-qdrant"
+	index("new-fresh", now.Add(-time.Hour))
+	index("new-stale", now.Add(-365*24*time.Hour))
+	require.Equal(t, []string{"old-fresh", "old-stale"}, retentionTestIDs(shared))
+	require.Equal(t, []string{"new-fresh", "new-stale"}, retentionTestIDs(qdrant), "indexing follows the move")
+
+	indexes := service.VectorStorageLimitIndexes(ctx)
+	require.Len(t, indexes, 1)
+	assert.Same(t, qdrant, indexes[0].Store, "the store itself, so its own limit counts it")
+
+	service.ForgetLogs(ctx, []string{"old-fresh", "new-fresh"})
+	assert.Equal(t, []string{"old-fresh", "old-stale"}, retentionTestIDs(shared), "the index left behind is deleted whole by upkeep")
+	assert.Equal(t, []string{"new-stale"}, retentionTestIDs(qdrant))
+
+	retention := map[string]int{"shared": 30}
+	service.SetVectorRetention(func(store string) int { return retention[store] })
+	swept, err := service.sweepExpiredVectors(ctx, now)
+	require.NoError(t, err)
+	assert.Zero(t, swept, "swept under the retention of the store the index is in")
+	retention["warp-qdrant"] = 30
+	swept, err = service.sweepExpiredVectors(ctx, now)
+	require.NoError(t, err)
+	assert.Equal(t, 1, swept)
+	assert.Empty(t, retentionTestIDs(qdrant))
+	assert.Equal(t, []string{"old-fresh", "old-stale"}, retentionTestIDs(shared))
 }

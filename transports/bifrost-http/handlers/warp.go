@@ -69,6 +69,9 @@ type WarpResolvers struct {
 	// UserGovernance answers what governs one person's spend. Nil leaves
 	// describe_user_limits out of Warp's tool set.
 	UserGovernance warp.UserGovernanceReader
+	// VectorStores are the configured vector stores Warp's settings may choose
+	// its log index's store from. Nil offers no choice: Warp uses the vectors given.
+	VectorStores warp.VectorStoreResolver
 	// CallerRestriction reports whether row-level access control narrows the
 	// caller's reads. Nil leaves Warp reading that off the request's own
 	// query scope, which is all an OSS deployment has.
@@ -143,6 +146,9 @@ func NewWarpHandler(store configstore.ConfigStore, live *livestore.Store, logger
 	}
 	if resolvers.UserGovernance != nil {
 		opts = append(opts, warp.WithUserGovernanceReader(resolvers.UserGovernance))
+	}
+	if resolvers.VectorStores != nil {
+		opts = append(opts, warp.WithVectorStores(resolvers.VectorStores))
 	}
 	if resolvers.CallerRestriction != nil {
 		opts = append(opts, warp.WithCallerRestrictionResolver(resolvers.CallerRestriction))
@@ -349,9 +355,12 @@ type warpJobSpec struct {
 
 func (h *WarpHandler) backfillSpec() warpJobSpec {
 	return warpJobSpec{
-		kind:        warp.BackfillJobKind,
-		partition:   "warp_log_embeddings",
-		conflicts:   []string{warp.BackfillJobKind},
+		kind:      warp.BackfillJobKind,
+		partition: "warp_log_embeddings",
+		conflicts: []string{warp.BackfillJobKind},
+		// A save that moves Warp's index holds it too, so a start cannot be admitted for the
+		// store the index is leaving.
+		admit:       h.service.LockBackfillAdmission,
 		noun:        "backfill",
 		plural:      "backfills",
 		startDenied: "Only administrators can backfill Warp embeddings",
@@ -431,7 +440,10 @@ func (h *WarpHandler) startJob(ctx *fasthttp.RequestCtx, spec warpJobSpec) {
 	case errors.Is(err, warp.ErrTopicsAlreadyBuilt):
 		SendError(ctx, fasthttp.StatusConflict, err.Error())
 		return
-	case errors.Is(err, warp.ErrUnavailable), errors.Is(err, warp.ErrNoVectorStore):
+	case errors.Is(err, warp.ErrNoVectorStore):
+		h.sendUnavailable(ctx, schemas.WarpUnavailableNoVectorStore, err.Error())
+		return
+	case errors.Is(err, warp.ErrUnavailable):
 		SendError(ctx, fasthttp.StatusServiceUnavailable, err.Error())
 		return
 	case err != nil:
@@ -491,6 +503,14 @@ func (h *WarpHandler) jobStatus(ctx *fasthttp.RequestCtx, spec warpJobSpec) {
 			// its topics belong to a space nothing reads.
 			job, err = h.backfillStore.GetLatestSidekiqJobByKind(ctx, spec.kind)
 			if err == nil && job != nil && !h.service.BackfillMatchesConfig(ctx, job.Metadata) {
+				job = nil
+			}
+			// An embedding backfill that indexed into another store says nothing
+			// about this one: after Warp's store changes, the page offers a fresh
+			// backfill instead of showing the old store's run as done. A run still
+			// in flight is shown above whichever store it names, since it holds the
+			// slot; one from another store ends fast, refusing to run there.
+			if err == nil && job != nil && spec.kind == warp.BackfillJobKind && !h.service.BackfillMatchesStore(job.Metadata) {
 				job = nil
 			}
 		}
@@ -675,6 +695,11 @@ func (h *WarpHandler) logIndexStatus(ctx *fasthttp.RequestCtx) {
 	if job != nil && !warpJobMatchesNamespace(job, view.LogVectorStoreNamespace) {
 		job = nil
 	}
+	// Likewise a job that indexed into another vector store: after Warp's store
+	// changes, the new store is empty whatever the last run said.
+	if job != nil && !h.service.BackfillMatchesStore(job.Metadata) {
+		job = nil
+	}
 	if job != nil {
 		backfill := warpBackfillStatusFromRow(job)
 		// This route has no admin gate, unlike the backfill endpoints. LastError
@@ -795,7 +820,7 @@ func (h *WarpHandler) putConfig(ctx *fasthttp.RequestCtx) {
 	case errors.Is(err, warp.ErrInvalidConfig):
 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
 		return
-	case errors.Is(err, warp.ErrBackfillInProgress):
+	case errors.Is(err, warp.ErrBackfillInProgress), errors.Is(err, warp.ErrVectorStoreChoiceChanged):
 		SendError(ctx, fasthttp.StatusConflict, err.Error())
 		return
 	case err != nil:

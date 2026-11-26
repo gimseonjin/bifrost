@@ -74,7 +74,7 @@ warp-config:
       '403':
         description: Caller is not the local admin (OSS) and lacks `Warp` Update (enterprise)
       '409':
-        description: Embedding configuration cannot change during an active backfill
+        description: Embedding configuration or the vector store cannot change during an active backfill, or another save changed the vector store after these settings were read
       '500':
         $ref: '../../openapi.yaml#/components/responses/InternalError'
       '503':

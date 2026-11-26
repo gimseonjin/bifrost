@@ -16,6 +16,7 @@ import (
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
+	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/vectorstore"
 )
@@ -78,8 +79,12 @@ type LogIndexer struct {
 	// a failed write clears it, because the failure may mean the namespace
 	// vanished underneath the cache.
 	ensureMu         sync.Mutex
+	ensuredStore     vectorstore.VectorStore
 	ensuredNamespace string
 	ensuredDimension int
+	// storeFor is the store a configuration row keeps the index in, so a write goes to the
+	// store whose namespace it read; nil uses vectors.
+	storeFor func(row *tables.TableWarpConfig) vectorstore.VectorStore
 	// drainBudget is how long Close lets accepted work finish before cancelling
 	// it. A field rather than a constant so a test can pick a short one without
 	// waiting out the production value.
@@ -176,12 +181,18 @@ func (i *LogIndexer) Index(ctx context.Context, entry *logstore.Log) (IndexOutco
 // the upsert after it failed: the provider billed the call either way, and the
 // backfill totals it so an operator can see what a window cost to index.
 func (i *LogIndexer) IndexWithConfig(ctx context.Context, config *schemas.WarpConfig, entry *logstore.Log) (IndexOutcome, *schemas.BifrostLLMUsage, error) {
+	return i.indexInto(ctx, config, nil, entry)
+}
+
+// indexInto is IndexWithConfig writing into vectors, the store a backfill page settled on;
+// nil is the store the configuration chooses.
+func (i *LogIndexer) indexInto(ctx context.Context, config *schemas.WarpConfig, vectors vectorstore.VectorStore, entry *logstore.Log) (IndexOutcome, *schemas.BifrostLLMUsage, error) {
 	item, ok := buildLogIndexItem(entry)
 	if !ok {
-		i.forget(ctx, config, entry)
+		i.forget(ctx, config, vectors, entry)
 		return IndexOutcomeSkipped, nil, nil
 	}
-	indexed, usage, err := i.indexItemWithConfig(ctx, config, item)
+	indexed, usage, err := i.indexItemWithConfig(ctx, config, vectors, item)
 	if err != nil {
 		return "", usage, err
 	}
@@ -198,11 +209,14 @@ func (i *LogIndexer) IndexWithConfig(ctx context.Context, config *schemas.WarpCo
 // under rules it no longer passes: its content has since been hidden, or it
 // is recognised as Warp's own. Best effort - the entry is skipped either way,
 // and a store that cannot delete must not fail the page it is part of.
-func (i *LogIndexer) forget(ctx context.Context, config *schemas.WarpConfig, entry *logstore.Log) {
+func (i *LogIndexer) forget(ctx context.Context, config *schemas.WarpConfig, vectors vectorstore.VectorStore, entry *logstore.Log) {
 	if entry == nil || entry.ID == "" || config == nil || !config.IsConfigured() {
 		return
 	}
-	if err := i.vectors.Delete(ctx, config.EffectiveLogVectorStoreNamespace(), entry.ID); err != nil && !errors.Is(err, vectorstore.ErrNotFound) {
+	if vectors == nil {
+		vectors = i.vectors
+	}
+	if err := vectors.Delete(ctx, config.EffectiveLogVectorStoreNamespace(), entry.ID); err != nil && !errors.Is(err, vectorstore.ErrNotFound) {
 		i.warnf("failed to remove the stale vector of Warp log %s: %v", entry.ID, err)
 	}
 }
@@ -244,7 +258,7 @@ func (i *LogIndexer) runItem(item logIndexItem) {
 }
 
 func (i *LogIndexer) indexItem(ctx context.Context, item logIndexItem) (bool, error) {
-	indexed, _, err := i.indexItemWithConfig(ctx, nil, item)
+	indexed, _, err := i.indexItemWithConfig(ctx, nil, nil, item)
 	return indexed, err
 }
 
@@ -252,30 +266,46 @@ func (i *LogIndexer) indexItem(ctx context.Context, item logIndexItem) (bool, er
 // reports whether anything was actually written so callers can tell "indexed"
 // apart from "there was nothing to index", along with the embedding call's
 // usage whenever one was made.
-func (i *LogIndexer) indexItemWithConfig(ctx context.Context, config *schemas.WarpConfig, item logIndexItem) (bool, *schemas.BifrostLLMUsage, error) {
+//
+// The store is settled once, before the embedding call, and the namespace is
+// provisioned and written in that store: a move saved while the call is in
+// flight must not send a vector into another store under the namespace and
+// width this one read. A write that lands in the store the index left is
+// deleted with that index.
+func (i *LogIndexer) indexItemWithConfig(ctx context.Context, config *schemas.WarpConfig, vectors vectorstore.VectorStore, item logIndexItem) (bool, *schemas.BifrostLLMUsage, error) {
+	fromRow := false
 	if config == nil {
 		row, err := i.store.GetWarpConfig(ctx)
 		if err != nil {
 			return false, nil, fmt.Errorf("read Warp configuration: %w", err)
 		}
 		config = configFromRow(row)
+		if vectors == nil && i.storeFor != nil {
+			vectors, fromRow = i.storeFor(row), true
+		}
 	}
 	if !config.IsConfigured() {
 		return false, nil, nil
 	}
+	if vectors == nil && !fromRow {
+		vectors = i.currentStore()
+	}
+	if vectors == nil {
+		return false, nil, ErrNoVectorStore
+	}
 	namespace := config.EffectiveLogVectorStoreNamespace()
-	if err := i.ensureNamespaceOnce(ctx, namespace, config.EmbeddingDimension); err != nil {
+	if err := i.ensureNamespaceOnce(ctx, vectors, namespace, config.EmbeddingDimension); err != nil {
 		return false, nil, err
 	}
 	embedding, usage, err := generateWarpEmbedding(ctx, i.embed, config, item.text)
 	if err != nil {
 		return false, usage, err
 	}
-	if err := i.vectors.Add(ctx, namespace, item.id, embedding, item.metadata); err != nil {
+	if err := vectors.Add(ctx, namespace, item.id, embedding, item.metadata); err != nil {
 		// The failure may mean the namespace vanished underneath the cache, so
 		// the next item re-provisions instead of writing into the void forever.
 		i.ensureMu.Lock()
-		i.ensuredNamespace, i.ensuredDimension = "", 0
+		i.ensuredStore, i.ensuredNamespace, i.ensuredDimension = nil, "", 0
 		i.ensureMu.Unlock()
 		return false, usage, err
 	}
@@ -283,19 +313,28 @@ func (i *LogIndexer) indexItemWithConfig(ctx context.Context, config *schemas.Wa
 	return true, usage, nil
 }
 
-// ensureNamespaceOnce provisions the namespace unless the last successful
-// ensure already covered this exact namespace/dimension pair.
-func (i *LogIndexer) ensureNamespaceOnce(ctx context.Context, namespace string, dimension int) error {
+// ensureNamespaceOnce provisions the namespace in a store unless the last
+// successful ensure already covered this exact store, namespace and dimension:
+// the same namespace in a store Warp moved to has not been provisioned there.
+func (i *LogIndexer) ensureNamespaceOnce(ctx context.Context, vectors vectorstore.VectorStore, namespace string, dimension int) error {
 	i.ensureMu.Lock()
 	defer i.ensureMu.Unlock()
-	if i.ensuredNamespace == namespace && i.ensuredDimension == dimension {
+	if i.ensuredStore == vectors && i.ensuredNamespace == namespace && i.ensuredDimension == dimension {
 		return nil
 	}
-	if _, err := ensureWarpNamespace(ctx, i.vectors, namespace, dimension); err != nil {
+	if _, err := ensureWarpNamespace(ctx, vectors, namespace, dimension); err != nil {
 		return err
 	}
-	i.ensuredNamespace, i.ensuredDimension = namespace, dimension
+	i.ensuredStore, i.ensuredNamespace, i.ensuredDimension = vectors, namespace, dimension
 	return nil
+}
+
+// currentStore is the store the index is in now: the one a Switchable holds, or vectors itself.
+func (i *LogIndexer) currentStore() vectorstore.VectorStore {
+	if switchable, ok := i.vectors.(*vectorstore.Switchable); ok {
+		return switchable.Current()
+	}
+	return i.vectors
 }
 
 // warpIndexDrainBudget is how long Close lets workers finish accepted items

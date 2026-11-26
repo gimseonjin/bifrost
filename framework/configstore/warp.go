@@ -53,3 +53,52 @@ func (s *RDBConfigStore) UpsertWarpConfig(ctx context.Context, config *tables.Ta
 		UpdateAll: true,
 	}).Create(config).Error
 }
+
+// UpsertWarpConfigMerging writes the singleton row like UpsertWarpConfig, after calling merge
+// with the row as stored now (nil when there is none), read under a lock held until the write
+// commits. A value the write derives from the stored row, such as the indexes Warp's index left
+// behind when it moved, is then computed from the row it replaces rather than from an earlier
+// read, so two overlapping saves cannot drop what the other one recorded. merge may run twice
+// and must compute what it sets from what it is given each time.
+func (s *RDBConfigStore) UpsertWarpConfigMerging(ctx context.Context, config *tables.TableWarpConfig, merge func(stored *tables.TableWarpConfig) error) error {
+	config.ID = tables.WarpConfigRowID
+	err := s.upsertWarpConfigMergingOnce(ctx, config, merge)
+	if errors.Is(err, errWarpRowTaken) {
+		// Another first save inserted the row since this one found none: lock it and merge again.
+		err = s.upsertWarpConfigMergingOnce(ctx, config, merge)
+	}
+	return err
+}
+
+// errWarpRowTaken is a first save finding that another one inserted the row first.
+var errWarpRowTaken = errors.New("warp config row was inserted by another save")
+
+func (s *RDBConfigStore) upsertWarpConfigMergingOnce(ctx context.Context, config *tables.TableWarpConfig, merge func(stored *tables.TableWarpConfig) error) error {
+	return s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var stored tables.TableWarpConfig
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&stored, tables.WarpConfigRowID).Error
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			// No row to lock, so two first saves can both get here. Each inserts without
+			// overwriting; the one that finds the row taken starts over, and then merges from
+			// the row the other wrote rather than from none.
+			if err := merge(nil); err != nil {
+				return err
+			}
+			result := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, DoNothing: true}).Create(config)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				return errWarpRowTaken
+			}
+			return nil
+		case err != nil:
+			return err
+		}
+		if err := merge(&stored); err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, UpdateAll: true}).Create(config).Error
+	})
+}

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"github.com/stretchr/testify/assert"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -97,16 +98,24 @@ func newBackfillTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, func
 // topics live in, for a test that writes them.
 func newTopicsTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, logstore.LogStore, func()) {
 	t.Helper()
-	topics := handlerTopicStore(t)
-	config := &recordingWarpStore{row: &tables.TableWarpConfig{
+	return newWarpJobsTestHandler(t, &tables.TableWarpConfig{
 		ID: tables.WarpConfigRowID, Enabled: true, Provider: "openai", Model: "gpt-4o",
 		EmbeddingProvider: "openai", EmbeddingModel: "embed", EmbeddingDimension: 2, LogVectorStoreNamespace: "WarpLogs",
-	}}
+	})
+}
+
+// newWarpJobsTestHandler is newTopicsTestHandler over the given configuration row, with the
+// given options after the defaults.
+func newWarpJobsTestHandler(t *testing.T, row *tables.TableWarpConfig, extra ...warp.Option) (*WarpHandler, *fakeSidekiqStore, logstore.LogStore, func()) {
+	t.Helper()
+	topics := handlerTopicStore(t)
+	config := &recordingWarpStore{row: row}
 	jobs := newFakeSidekiqStore()
 	runner := sidekiq.New(jobs, &mockLogger{}, 1, "")
-	service := warpServiceForTest(t, nil, warp.WithConfigStore(config), warp.WithLogReader(handlerBackfillReader{topics: topics}), warp.WithVectorStore(handlerVectorStore{}), warp.WithEmbeddingExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+	opts := []warp.Option{warp.WithConfigStore(config), warp.WithLogReader(handlerBackfillReader{topics: topics}), warp.WithVectorStore(handlerVectorStore{}), warp.WithEmbeddingExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
 		return &schemas.BifrostEmbeddingResponse{Data: []schemas.EmbeddingData{{Embedding: schemas.EmbeddingStruct{EmbeddingArray: []float64{0, 1}}}}}, nil
-	}))
+	})}
+	service := warpServiceForTest(t, nil, append(opts, extra...)...)
 	service.RegisterBackfill(runner)
 	handler := &WarpHandler{service: service, sidekiqRunner: runner, backfillStore: jobs}
 	return handler, jobs, topics, func() { runner.Shutdown(); service.Shutdown() }
@@ -1598,4 +1607,137 @@ func warpServiceForTest(t testing.TB, store configstore.ConfigStore, opts ...war
 		t.Fatal(err)
 	}
 	return service
+}
+
+// warpHandlerStores is a registry of a primary store "shared", a connected
+// "warp-qdrant", and "down", which failed at startup.
+func warpHandlerStores(t *testing.T) *vectorstore.Registry {
+	t.Helper()
+	qdrant := func(name, host string) vectorstore.Config {
+		return vectorstore.Config{Name: name, Enabled: true, Type: vectorstore.VectorStoreTypeQdrant, Config: vectorstore.QdrantConfig{Host: *schemas.NewSecretVar(host)}}
+	}
+	primary := qdrant("shared", "shared")
+	registry, err := vectorstore.OpenRegistry(context.Background(), &primary, []vectorstore.Config{qdrant("warp-qdrant", "warp"), qdrant("down", "down")}, nil,
+		vectorstore.RegistryOptions{Connect: func(_ context.Context, config *vectorstore.Config, _ schemas.Logger) (vectorstore.VectorStore, error) {
+			if config.Name == "down" {
+				return nil, errors.New("connection refused")
+			}
+			return handlerVectorStore{}, nil
+		}})
+	require.NoError(t, err)
+	return registry
+}
+
+func warpJobsTestRow(vectorStore string) *tables.TableWarpConfig {
+	return &tables.TableWarpConfig{
+		ID: tables.WarpConfigRowID, Enabled: true, Provider: "openai", Model: "gpt-4o",
+		EmbeddingProvider: "openai", EmbeddingModel: "embed", EmbeddingDimension: 2, LogVectorStoreNamespace: "WarpLogs",
+		VectorStore: vectorStore,
+	}
+}
+
+// The settings page names the store Warp's index is kept in, and a save naming
+// a store config.json does not configure is a 400 saying so.
+func TestWarpConfigNamesItsVectorStoreAndRefusesAnUnknownOne(t *testing.T) {
+	handler, _, _, cleanup := newWarpJobsTestHandler(t, warpJobsTestRow("warp-qdrant"), warp.WithVectorStores(warpHandlerStores(t)))
+	defer cleanup()
+
+	getCtx := adminCtx("")
+	handler.getConfig(getCtx)
+	require.Equal(t, fasthttp.StatusOK, getCtx.Response.StatusCode(), string(getCtx.Response.Body()))
+	got := string(getCtx.Response.Body())
+	assert.Contains(t, got, `"vector_store":"warp-qdrant"`)
+	assert.Contains(t, got, `"connected_vector_store":{"name":"warp-qdrant","type":"qdrant","primary":false}`)
+
+	ctx := adminCtx(`{"enabled":true,"provider":"openai","model":"gpt-4o","embedding_provider":"openai","embedding_model":"embed","embedding_dimension":2,"log_vector_store_namespace":"WarpLogs","vector_store":"nobody"}`)
+	handler.putConfig(ctx)
+	require.Equal(t, fasthttp.StatusBadRequest, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+	assert.Contains(t, string(ctx.Response.Body()), `vector_store \"nobody\" is not configured in config.json`)
+}
+
+// Starting a backfill while the store Warp is set to use is unavailable is a
+// 503 with the no_vector_store reason the dashboard branches on, naming the
+// store and why.
+func TestWarpJobStartWithAnUnavailableStoreSaysWhich(t *testing.T) {
+	handler, _, _, cleanup := newWarpJobsTestHandler(t, warpJobsTestRow("down"), warp.WithVectorStores(warpHandlerStores(t)))
+	defer cleanup()
+	ctx := adminCtx(`{"start_time":"2026-09-01T00:00:00Z","end_time":"2026-09-02T00:00:00Z"}`)
+	handler.startBackfill(ctx)
+	require.Equal(t, fasthttp.StatusServiceUnavailable, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+	body := string(ctx.Response.Body())
+	assert.Contains(t, body, string(schemas.WarpUnavailableNoVectorStore))
+	assert.Contains(t, body, `Warp's vector store \"down\" could not be reached at startup`)
+}
+
+// After Warp's index moves, a finished backfill that filled the index it left
+// says nothing about the new one: the settings page and the tray show no run,
+// so a new backfill is offered. A run that built the index in use is shown, and
+// so is one still in flight from the old index, which holds the slot.
+func TestWarpBackfillStatusHidesARunIntoAnotherStore(t *testing.T) {
+	row := warpJobsTestRow("warp-qdrant")
+	row.VectorIndexID = "now"
+	handler, jobs, _, cleanup := newWarpJobsTestHandler(t, row, warp.WithVectorStores(warpHandlerStores(t)))
+	defer cleanup()
+	current, err := handler.service.BuildBackfillJobMeta(context.Background(), time.Unix(1, 0), time.Unix(2, 0), false)
+	require.NoError(t, err)
+	require.Contains(t, current, `"vector_index":"now"`)
+	var meta warp.BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(current), &meta))
+	meta.VectorIndex = "before-the-move"
+	elsewhere, err := sonic.Marshal(meta)
+	require.NoError(t, err)
+	jobs.latest = &tables.TableSidekiqJob{ID: "job-done", Kind: warp.BackfillJobKind, Status: tables.SidekiqStatusCompleted, Metadata: string(elsewhere)}
+
+	statusCtx := adminCtx("")
+	handler.backfillStatus(statusCtx)
+	require.Equal(t, fasthttp.StatusOK, statusCtx.Response.StatusCode())
+	assert.NotContains(t, string(statusCtx.Response.Body()), "job-done")
+	trayCtx := adminCtx("")
+	handler.logIndexStatus(trayCtx)
+	assert.NotContains(t, string(trayCtx.Response.Body()), "job-done")
+
+	jobs.latest.Metadata = current
+	statusCtx = adminCtx("")
+	handler.backfillStatus(statusCtx)
+	assert.Contains(t, string(statusCtx.Response.Body()), `"id":"job-done"`)
+
+	jobs.inFlight = &tables.TableSidekiqJob{ID: "job-old-store", Kind: warp.BackfillJobKind, Status: tables.SidekiqStatusRunning, Metadata: string(elsewhere)}
+	statusCtx = adminCtx("")
+	handler.backfillStatus(statusCtx)
+	assert.Contains(t, string(statusCtx.Response.Body()), "job-old-store", "the run that blocks a new one is shown")
+}
+
+// staleOnReadWarpStore serves a stale row to one read, as a save that read
+// before another save committed has seen, and the stored row otherwise.
+type staleOnReadWarpStore struct {
+	*recordingWarpStore
+	stale   *tables.TableWarpConfig
+	reads   int
+	staleAt int
+}
+
+func (s *staleOnReadWarpStore) GetWarpConfig(ctx context.Context) (*tables.TableWarpConfig, error) {
+	s.reads++
+	if s.reads == s.staleAt {
+		return s.stale, nil
+	}
+	return s.recordingWarpStore.GetWarpConfig(ctx)
+}
+
+// A save that read the settings before another save changed Warp's vector
+// store is a 409 saying so, and the other save's choice stands.
+func TestWarpConfigSaveAfterAnotherChangedTheStoreIsAConflict(t *testing.T) {
+	stored := warpJobsTestRow("warp-qdrant")
+	stored.VectorIndexID = "moved"
+	// The handler reads the row for the audit record first; the save's own read is the stale one.
+	store := &staleOnReadWarpStore{recordingWarpStore: &recordingWarpStore{row: stored}, stale: warpJobsTestRow(""), staleAt: 2}
+	service := warpServiceForTest(t, nil, warp.WithConfigStore(store), warp.WithVectorStore(handlerVectorStore{}), warp.WithVectorStores(warpHandlerStores(t)))
+	t.Cleanup(service.Shutdown)
+
+	ctx := adminCtx(`{"enabled":true,"provider":"openai","model":"gpt-4o"}`)
+	(&WarpHandler{service: service}).putConfig(ctx)
+	require.Equal(t, fasthttp.StatusConflict, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+	assert.Contains(t, string(ctx.Response.Body()), "Warp's vector store was changed by another save; reload the settings and save again")
+	assert.Equal(t, "warp-qdrant", store.row.VectorStore)
+	assert.Equal(t, "moved", store.row.VectorIndexID)
 }

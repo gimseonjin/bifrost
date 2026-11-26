@@ -201,6 +201,7 @@ Omit the section to manage Warp entirely from the dashboard. The `warp` feature 
 | `embedding_api_key_id` | Embedding API key | Any key | - | Pins embedding calls to one key. |
 | `embedding_dimension` | Embedding dimension | `1536` | Required when enabled | The vector size the embedding model returns. |
 | `log_vector_store_namespace` | Log embedding namespace | `BifrostWarpLogs` | Must change when the embedding provider, model, or dimension changes | The vector store namespace holding Warp's log index. |
+| `vector_store` | Vector store | `""` (the primary store) | The name of a connected store from `vector_store` or `vector_stores` in `config.json`. Not changeable while a backfill runs. | Which configured vector store holds Warp's log index. Shown only when more than one store is configured. See [Choose the vector store](#choose-the-vector-store). Omitted keeps the stored value. |
 | `semantic_search_threshold` | Similarity threshold | `0.5` | Greater than `0`, at most `1` | Minimum similarity for a semantic search match. |
 | `semantic_search_limit` | Maximum matches | `10` | `1`–`25` | Most matches one semantic search returns. |
 | `topic_discovery_min_requests` | New topic threshold | `100` | `10`–`20000` | How many requests that matched no topic must be waiting before Warp clusters them into new topics. |
@@ -278,6 +279,25 @@ Only one backfill runs at a time. Starting a second one returns `409` with the r
 Vectors from different embedding models cannot be compared. When you change the embedding provider, model, or dimension, you must also choose a new **Log embedding namespace**. Bifrost rejects the save otherwise. The new namespace starts empty, so run a backfill to fill it.
 
 You cannot change the embedding configuration while a backfill is running. Cancel it first.
+
+### Choose the vector store
+
+When `config.json` configures more than one vector store (`vector_store` and [`vector_stores`](/deployment-guides/config-json/storage#more-than-one-store-vector_stores)), **Settings > Warp** shows a **Vector store** picker under **Conversation search**. Warp keeps its log index in the primary `vector_store` until you choose another.
+
+Moving the index to another store:
+
+- Starts a new, empty index in the new store and provisions the log embedding namespace there. Run a backfill to index past logs. A finished backfill into the old store is no longer shown, so the page offers a new one.
+- Deletes Warp's index from the old store. Bifrost waits 10 minutes so that writes already in flight can land, then deletes it on the next hourly upkeep pass. If the old store can't be reached, the deletion is retried on every pass until it can. Only Warp's own vectors are deleted: a namespace that also holds other vectors keeps them. Until then, log deletes, retention and the storage limit apply only to the store the index is in now.
+- Is not needed for a store renamed in `config.json`. Choosing the store under its new name keeps the same index, because Bifrost recognizes a store by where it keeps its data, not by its name.
+- Moving back to a store before its old index is deleted deletes that index right away, so the store starts empty again and needs a fresh backfill.
+- Is refused while a backfill is running (`409`), and refused with `400` when the store is not configured or not connected. A save made from settings that another save has since moved to a different store is refused with `409`. Reload the page and save again.
+- Takes effect on every node with its next read of the configuration.
+
+Keep the old store configured in `config.json` until its index is deleted. If you remove it before that, its Warp vectors stay in it and you have to delete them yourself. The exception is an in-memory store, whose vectors are gone when the process stops.
+
+If the chosen store is later removed from `config.json`, disabled, or cannot be reached at startup, Warp does not fall back to another store. Chat keeps working without semantic log search, new logs are not indexed, and starting a backfill or a topics run answers `503` with reason `no_vector_store`, naming the store and why. While Warp is enabled, saving its settings is refused until you choose a working store; turning Warp off is always allowed.
+
+Set it in `config.json` with `warp.vector_store` (a store's name; `""` is the primary store), or in Helm with `bifrost.warp.vectorStore`.
 
 ---
 
@@ -458,8 +478,8 @@ The response body has a `reason` field:
 
 ### The Enable Warp switch is disabled
 
-**Cause:** No vector store is connected.
-**Fix:** Configure a [vector store](/architecture/framework/vector-store). The settings page shows the connection status under **Conversation search**.
+**Cause:** No vector store is connected, or the store Warp is set to use is unavailable.
+**Fix:** Configure a [vector store](/architecture/framework/vector-store), or [choose a connected one](#choose-the-vector-store). The settings page shows the connection status, and why a chosen store is unavailable, under **Conversation search**.
 
 ### Saving fails with "namespace must change"
 
@@ -468,8 +488,8 @@ The response body has a `reason` field:
 
 ### Saving or starting a backfill returns 409
 
-**Cause:** A backfill is already running.
-**Fix:** Wait for it to finish, or cancel it from the settings page or [Background jobs](/features/observability/default#background-jobs).
+**Cause:** A backfill is already running, or, when saving, another save changed Warp's vector store after the settings page was loaded.
+**Fix:** Wait for the backfill to finish, or cancel it from the settings page or [Background jobs](/features/observability/default#background-jobs). For a changed vector store, reload the settings page and save again.
 
 ### Semantic search misses recent conversations
 

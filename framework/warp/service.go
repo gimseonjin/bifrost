@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -94,17 +95,25 @@ type Service struct {
 	// topicsAdmitMu admits jobs to TopicsJobPartition one at a time (see
 	// LockTopicsJobAdmission).
 	topicsAdmitMu sync.Mutex
+	// backfillAdmitMu admits a backfill, and a save that moves the index, one at a time (see LockBackfillAdmission).
+	backfillAdmitMu sync.Mutex
 	// catalog prices Warp's own usage. Nil is supported: the panel then reports
 	// tokens without a cost, rather than reporting a cost of zero.
 	catalog     *modelcatalog.ModelCatalog
 	vectorStore vectorstore.VectorStore
-	// vectorRetention reports the vector retention in days, for the vector sweep.
-	vectorRetention func() int
-	embed        EmbeddingExecutor
-	indexer      *LogIndexer
-	semantic     *SemanticSearcher
-	topics       *TopicReader
-	backfillJobs BackfillJobStore
+	// vectorStores, when set, are the stores Warp may keep its index in; vectorSlot is then
+	// the vectorStore every part uses, holding the one selection names (see vectorselection.go).
+	vectorStores VectorStoreResolver
+	vectorSlot   *vectorstore.Switchable
+	selection    atomic.Pointer[vectorSelection]
+	selectionMu  sync.Mutex // held across a change of selection and vectorSlot together
+	// vectorRetention reports a store's vector retention in days, for the vector sweep.
+	vectorRetention func(store string) int
+	embed           EmbeddingExecutor
+	indexer         *LogIndexer
+	semantic        *SemanticSearcher
+	topics          *TopicReader
+	backfillJobs    BackfillJobStore
 	// topicLimits bounds a topics run. Zero means the defaults; tests shrink
 	// them so a run crosses its thresholds on a handful of requests.
 	topicLimits topicLimits
@@ -287,9 +296,23 @@ func NewService(store configstore.ConfigStore, live *livestore.Store, opts ...Op
 	for _, opt := range opts {
 		opt(service)
 	}
+	if service.vectorStores != nil {
+		// Until the configuration is read, the primary store, where an index chosen before
+		// there was a choice is kept; the first read of the row follows its choice.
+		initial := service.resolveSelection("")
+		service.selection.Store(initial)
+		service.vectorSlot = vectorstore.NewSwitchable(initial.store())
+		service.vectorStore = service.vectorSlot
+		if service.store != nil {
+			service.store = &selectionFollowingStore{WarpStore: service.store, follow: service.followVectorStore}
+		}
+	}
 	service.topics = service.buildTopicReader()
 	if service.store != nil && service.vectorStore != nil && service.embed != nil {
 		service.indexer = NewLogIndexer(service.store, service.vectorStore, service.embed, service.logger)
+		if service.vectorSlot != nil {
+			service.indexer.storeFor = service.storeForRow
+		}
 		service.indexer.SetTopicStore(topicStoreOf(service.logs))
 		if service.logs != nil {
 			// Only when the reader can hydrate. A reader that cannot is still a
@@ -495,6 +518,10 @@ func (s *Service) buildSemanticSearcher() *SemanticSearcher {
 func (s *Service) researchDeps() (LogReader, *SemanticSearcher) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if !s.hasVectorStore() {
+		// The chosen store is unavailable: no semantic search to offer, as with no store at all.
+		return s.logs, nil
+	}
 	return s.logs, s.semantic
 }
 
@@ -519,7 +546,7 @@ func (s *Service) ChatUnavailableReason() schemas.WarpUnavailableReason {
 // IndexLog accepts a post-persistence logging notification. It copies and
 // queues bounded data; provider and vector-store I/O happen in worker goroutines.
 func (s *Service) IndexLog(ctx context.Context, entry *logstore.Log) {
-	if s.indexer != nil {
+	if s.indexer != nil && s.hasVectorStore() {
 		s.indexer.Enqueue(ctx, entry)
 	}
 }

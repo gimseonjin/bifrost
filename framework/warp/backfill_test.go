@@ -19,6 +19,7 @@ import (
 	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet"
 	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet/datasheettest"
 	"github.com/maximhq/bifrost/framework/sidekiq"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -957,3 +958,114 @@ func catalogWithDatasheetForTest(t testing.TB, ds *datasheet.Store) *modelcatalo
 
 // datasheetForTest returns a datasheet over a new live store closed when the test ends.
 var datasheetForTest = datasheettest.New
+
+// backfillServiceIn is a backfill service over the stores of warpStoresForTest,
+// keeping its index in the one row chooses.
+func backfillServiceIn(t *testing.T, store *recordingStore, jobs BackfillJobStore) *Service {
+	t.Helper()
+	stores, _, _ := warpStoresForTest()
+	opts := []Option{WithConfigStore(store), WithLogReader(&backfillLogReader{}), WithVectorStores(stores), WithEmbeddingExecutor(backfillEmbeddingExecutor)}
+	if jobs != nil {
+		opts = append(opts, WithBackfillJobStore(jobs))
+	}
+	return serviceForTest(t, nil, opts...)
+}
+
+// A backfill names the index it built, so after Warp's index moves a run that
+// filled the index it left is not taken for the new one. A job from before
+// stores could be chosen built an index that never moved.
+func TestWarpBackfillMatchesOnlyTheIndexItBuilt(t *testing.T) {
+	ctx := context.Background()
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	row := validWarpConfigRow()
+	row.VectorIndexID = "first"
+	store := &recordingStore{row: row}
+	service := backfillServiceIn(t, store, nil)
+	metaJSON, err := service.BuildBackfillJobMeta(ctx, start, start.Add(time.Hour), false)
+	require.NoError(t, err)
+	var meta BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(metaJSON), &meta))
+	assert.Equal(t, "first", meta.VectorIndex, "the checkpoint names its index")
+	assert.True(t, service.BackfillMatchesStore(metaJSON))
+	legacy := `{"config_signature":"x","namespace":"BifrostWarpLogs"}`
+	assert.False(t, service.BackfillMatchesStore(legacy), "built before the index moved")
+
+	store.row.VectorStore, store.row.VectorIndexID = "warp-qdrant", "second"
+	_, err = service.Config(ctx) // another node moved the index; this one follows on its next read
+	require.NoError(t, err)
+	assert.False(t, service.BackfillMatchesStore(metaJSON), "the index it left is not the index now")
+	assert.True(t, service.BackfillMatchesStore("not json"), "unreadable metadata is left to BackfillMatchesConfig")
+
+	never := backfillServiceIn(t, &recordingStore{row: validWarpConfigRow()}, nil)
+	_, err = never.Config(ctx)
+	require.NoError(t, err)
+	assert.True(t, never.BackfillMatchesStore(legacy), "an index that never moved is the one a job from before built")
+}
+
+// A stopped backfill resumes from its checkpoint only into the store it was
+// indexing; after a move a new backfill starts a clean scan of the new store.
+func TestWarpBackfillDoesNotResumeIntoAnotherStore(t *testing.T) {
+	ctx := context.Background()
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	cursor := start.Add(30 * time.Minute)
+	store := &recordingStore{row: validWarpConfigRow()}
+	built, err := backfillServiceIn(t, store, nil).BuildBackfillJobMeta(ctx, start, end, false)
+	require.NoError(t, err)
+	var stopped BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(built), &stopped))
+	stopped.CursorTime, stopped.Total, stopped.Scanned = &cursor, 10, 5
+	stoppedJSON, err := marshalBackfillMeta(stopped)
+	require.NoError(t, err)
+	jobs := activeBackfillStore{active: &tables.TableSidekiqJob{ID: "stopped", Status: tables.SidekiqStatusFailed, Metadata: stoppedJSON}}
+	resume := func() BackfillJobMeta {
+		metaJSON, err := backfillServiceIn(t, store, jobs).BuildBackfillJobMeta(ctx, start, end, false)
+		require.NoError(t, err)
+		var meta BackfillJobMeta
+		require.NoError(t, sonic.Unmarshal([]byte(metaJSON), &meta))
+		return meta
+	}
+
+	assert.Equal(t, 5, resume().Scanned, "the same index resumes from the checkpoint")
+	store.row.VectorStore, store.row.VectorIndexID = "warp-qdrant", "moved"
+	fresh := resume()
+	assert.Zero(t, fresh.Scanned, "another store starts a clean scan")
+	assert.Nil(t, fresh.CursorTime)
+	assert.Equal(t, "moved", fresh.VectorIndex)
+
+	store.row.VectorStore, store.row.VectorIndexID = "", "back"
+	back := resume()
+	assert.Zero(t, back.Scanned, "back in the store it left, the index is new and the old checkpoint does not cover it")
+	assert.Nil(t, back.CursorTime)
+}
+
+// A job run against a store other than the one its checkpoint names (picked up
+// after a restart, or running while another node moved the index) stops and
+// keeps its checkpoint, rather than write past a cursor the store never had.
+func TestWarpBackfillRefusesToRunIntoAnotherStore(t *testing.T) {
+	ctx := context.Background()
+	store := &recordingStore{row: validWarpConfigRow()}
+	service := backfillServiceIn(t, store, nil)
+	metaJSON, err := service.BuildBackfillJobMeta(ctx, time.Now().Add(-time.Hour), time.Now(), false)
+	require.NoError(t, err)
+
+	store.row.VectorStore, store.row.VectorIndexID = "warp-qdrant", "moved"
+	finalJSON, err := service.RunBackfillJob(ctx, tables.TableSidekiqJob{Metadata: metaJSON}, func(string) error { return nil })
+	require.ErrorContains(t, err, "Warp's log index moved to another vector store since this backfill was started")
+	require.JSONEq(t, metaJSON, finalJSON, "the checkpoint is kept as it was")
+
+	store.row.VectorStore, store.row.VectorIndexID = "", ""
+	_, err = service.RunBackfillJob(ctx, tables.TableSidekiqJob{Metadata: metaJSON}, func(string) error { return nil })
+	require.NoError(t, err, "with the index it was written for, it runs")
+}
+
+// With the chosen store unavailable, starting a backfill says which store and
+// why, before anything else.
+func TestWarpBackfillWithAnUnavailableStoreSaysWhich(t *testing.T) {
+	row := validWarpConfigRow()
+	row.VectorStore = "down"
+	service := backfillServiceIn(t, &recordingStore{row: row}, nil)
+	_, err := service.BuildBackfillJobMeta(context.Background(), time.Now().Add(-time.Hour), time.Now(), false)
+	require.ErrorIs(t, err, ErrNoVectorStore)
+	assert.ErrorContains(t, err, `Warp's vector store "down" could not be reached at startup`)
+}

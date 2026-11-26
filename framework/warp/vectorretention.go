@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maximhq/bifrost/framework/configstore"
+	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/vectorstore"
 )
@@ -26,11 +27,12 @@ import (
 // keeps the deleted request's metadata - who sent it, its team, its cost - for
 // as long as the deployment runs.
 
-// SetVectorRetention tells the service how long the deployment keeps vectors,
-// as a function so a retention changed at runtime is read at each sweep. The
-// server passes the effective vector retention, which never exceeds the logs'.
-// Zero or no function means no sweep.
-func (s *Service) SetVectorRetention(days func() int) {
+// SetVectorRetention tells the service how long each vector store keeps vectors,
+// by the store's name ("" when Warp has no choice of stores), as a function so a
+// retention changed at runtime is read at each sweep. The server passes the
+// effective vector retention, which never exceeds the logs'. Zero or no function
+// means no sweep.
+func (s *Service) SetVectorRetention(days func(store string) int) {
 	s.mu.Lock()
 	s.vectorRetention = days
 	s.mu.Unlock()
@@ -45,26 +47,41 @@ const vectorDeleteRetryBatch = 500
 // gone is not an error; one it cannot remove - the vector store is down, or
 // the request was cancelled - is recorded for upkeep to retry.
 func (s *Service) ForgetLogs(ctx context.Context, ids []string) {
-	s.mu.RLock()
-	vectors := s.vectorStore
-	s.mu.RUnlock()
-	if vectors == nil || len(ids) == 0 {
+	if s.store == nil || len(ids) == 0 {
 		return
 	}
 	// The stored namespace, whether or not Warp is switched on: a log deleted
 	// while it is off still has a vector, and Config refuses a disabled Warp.
 	// Without an embedding model nothing was ever indexed. A configuration
 	// that cannot be read leaves every delete to the retry, which reads the
-	// namespace then.
-	namespace := ""
-	view, err := s.ConfigView(ctx)
-	switch {
-	case errors.Is(err, ErrUnavailable):
+	// namespace then. The vector is in the store the configuration names: an
+	// index Warp moved away from is deleted whole by upkeep.
+	row, err := s.store.GetWarpConfig(ctx)
+	if err != nil {
+		failed := make([]logstore.WarpVectorDelete, 0, len(ids))
+		for _, id := range ids {
+			failed = append(failed, logstore.WarpVectorDelete{LogID: id})
+		}
+		s.recordVectorDeletes(ctx, failed, fmt.Errorf("read Warp configuration: %w", err))
 		return
-	case err == nil && view.EmbeddingModel == "":
+	}
+	if row == nil || row.EmbeddingModel == "" {
 		return
-	case err == nil:
-		namespace = view.LogVectorStoreNamespace
+	}
+	namespace := configFromRow(row).EffectiveLogVectorStoreNamespace()
+	vectors := s.storeForRow(row)
+	if vectors == nil {
+		// A store that is configured but cannot be reached now still holds the
+		// vectors, so the deletes wait for it. One no longer configured at all
+		// cannot be reached by any later pass either.
+		if unreachable := s.unreachableVectorStore(row); unreachable != nil {
+			failed := make([]logstore.WarpVectorDelete, 0, len(ids))
+			for _, id := range ids {
+				failed = append(failed, logstore.WarpVectorDelete{LogID: id, Namespace: namespace})
+			}
+			s.recordVectorDeletes(ctx, failed, unreachable)
+		}
+		return
 	}
 	var failed []logstore.WarpVectorDelete
 	for _, id := range ids {
@@ -83,6 +100,19 @@ func (s *Service) ForgetLogs(ctx context.Context, ids []string) {
 		return
 	}
 	s.recordVectorDeletes(ctx, failed, err)
+}
+
+// unreachableVectorStore is why the store a row chooses cannot be used now when it is
+// configured (it failed at startup, or is disabled); nil when it can be, or is not configured.
+func (s *Service) unreachableVectorStore(row *tables.TableWarpConfig) error {
+	if s.vectorSlot == nil || row == nil {
+		return nil
+	}
+	selection := s.rowSelection(row)
+	if selection.entry == nil || selection.store() != nil {
+		return nil
+	}
+	return unavailableVectorStore(selection)
 }
 
 // recordVectorDeletes keeps the deletes ForgetLogs could not do, on a context
@@ -107,18 +137,25 @@ func (s *Service) recordVectorDeletes(ctx context.Context, failed []logstore.War
 // failure: the store that refused one is most likely refusing all of them,
 // and the rest wait for the next pass.
 func (s *Service) retryVectorDeletes(ctx context.Context) (int, error) {
-	s.mu.RLock()
-	vectors := s.vectorStore
-	s.mu.RUnlock()
 	store := s.topicStore()
-	if vectors == nil || store == nil {
+	if s.store == nil || store == nil {
+		return 0, nil
+	}
+	// One read for the store and for the namespace of a delete recorded without
+	// one, so the two always belong to the same configuration.
+	row, err := s.store.GetWarpConfig(ctx)
+	if err != nil || row == nil {
+		return 0, err
+	}
+	vectors := s.storeForRow(row)
+	if vectors == nil {
 		return 0, nil
 	}
 	rows, err := store.ListWarpVectorDeletes(ctx, vectorDeleteRetryBatch)
 	if err != nil || len(rows) == 0 {
 		return 0, err
 	}
-	configured := ""
+	configured := configFromRow(row).EffectiveLogVectorStoreNamespace()
 	done := make([]string, 0, len(rows))
 	// A ClickHouse table lists a log recorded twice twice until it merges.
 	seen := make(map[string]struct{}, len(rows))
@@ -130,14 +167,6 @@ func (s *Service) retryVectorDeletes(ctx context.Context) (int, error) {
 		seen[row.LogID] = struct{}{}
 		namespace := row.Namespace
 		if namespace == "" {
-			if configured == "" {
-				view, err := s.ConfigView(ctx)
-				if err != nil {
-					failure = err
-					break
-				}
-				configured = view.LogVectorStoreNamespace
-			}
 			namespace = configured
 		}
 		if err := vectors.Delete(ctx, namespace, row.LogID); err != nil && !errors.Is(err, vectorstore.ErrNotFound) {
@@ -170,31 +199,43 @@ func retentionCutoff(now time.Time, days int) time.Time {
 // retention, and reports how many went.
 func (s *Service) sweepExpiredVectors(ctx context.Context, now time.Time) (int, error) {
 	s.mu.RLock()
-	vectors, retention := s.vectorStore, s.vectorRetention
+	retention := s.vectorRetention
 	s.mu.RUnlock()
-	if vectors == nil || retention == nil {
-		return 0, nil
-	}
-	days := retention()
-	if days <= 0 {
+	if retention == nil || s.store == nil {
 		return 0, nil
 	}
 	// The stored namespace, whether or not Warp is switched on, as ForgetLogs
 	// reads it: logs keep expiring while Warp is off. Without an embedding
-	// model nothing was ever indexed, so there is nothing to sweep.
-	view, err := s.ConfigView(ctx)
-	if errors.Is(err, ErrUnavailable) {
-		return 0, nil
-	}
-	if err != nil || view.EmbeddingModel == "" {
+	// model nothing was ever indexed, so there is nothing to sweep. The index
+	// is swept in the store the configuration names, under that store's
+	// retention.
+	row, err := s.store.GetWarpConfig(ctx)
+	if err != nil || row == nil || row.EmbeddingModel == "" {
 		return 0, err
 	}
+	vectors := s.storeForRow(row)
+	if vectors == nil {
+		return 0, nil
+	}
+	days := retention(s.vectorStoreName(row))
+	if days <= 0 {
+		return 0, nil
+	}
 	cutoff := retentionCutoff(now, days)
-	deleted, err := vectors.DeleteAll(ctx, view.LogVectorStoreNamespace, []vectorstore.Query{
+	deleted, err := vectors.DeleteAll(ctx, configFromRow(row).EffectiveLogVectorStoreNamespace(), []vectorstore.Query{
 		{Field: "warp_log", Operator: vectorstore.QueryOperatorEqual, Value: true},
 		{Field: "timestamp", Operator: vectorstore.QueryOperatorLessThan, Value: cutoff.Unix()},
 	})
 	return len(deleted), err
+}
+
+// vectorStoreName is the name of the store a row chooses, for its settings; "" without a
+// choice of stores.
+func (s *Service) vectorStoreName(row *tables.TableWarpConfig) string {
+	if entry := s.rowSelection(row).entry; entry != nil {
+		return entry.Name
+	}
+	return ""
 }
 
 // VectorStorageLimitIndexes is Warp's log index, for the vector storage limit, which bounds
@@ -202,16 +243,19 @@ func (s *Service) sweepExpiredVectors(ctx context.Context, now time.Time) (int, 
 // their oldest vectors first. None without a vector store or an embedding
 // model (nothing was indexed), or while the configuration cannot be read.
 func (s *Service) VectorStorageLimitIndexes(ctx context.Context) []vectorstore.StorageLimitIndex {
-	s.mu.RLock()
-	vectors := s.vectorStore
-	s.mu.RUnlock()
+	if s.store == nil {
+		return nil
+	}
+	row, err := s.store.GetWarpConfig(ctx)
+	if err != nil || row == nil || row.EmbeddingModel == "" {
+		return nil
+	}
+	vectors := s.storeForRow(row)
 	if vectors == nil {
 		return nil
 	}
-	view, err := s.ConfigView(ctx)
-	if err != nil || view.EmbeddingModel == "" {
-		return nil
-	}
+	config := configFromRow(row)
+	namespace := config.EffectiveLogVectorStoreNamespace()
 	// Opened before it is counted, with the width the configuration gives: an
 	// embedded Chromem store cannot enumerate a namespace this process has not
 	// opened, and would otherwise drop out of the limit after a restart until
@@ -219,13 +263,15 @@ func (s *Service) VectorStorageLimitIndexes(ctx context.Context) []vectorstore.S
 	// opening fails, the index is still offered, and the limit reports it as
 	// skipped with the reason.
 	if s.indexer != nil {
-		if err := s.indexer.ensureNamespaceOnce(ctx, view.LogVectorStoreNamespace, view.EmbeddingDimension); err != nil {
+		if err := s.indexer.ensureNamespaceOnce(ctx, vectors, namespace, config.EmbeddingDimension); err != nil {
 			s.warnf("failed to open Warp's log index for the vector storage limit: %v", err)
 		}
 	}
+	// The store itself, not the Switchable over it, so the limit of the store it
+	// is in counts it.
 	return []vectorstore.StorageLimitIndex{{
-		Name: "Warp's log index", Store: vectors, Namespace: view.LogVectorStoreNamespace,
-		Dimension: view.EmbeddingDimension, TimestampField: "timestamp",
+		Name: "Warp's log index", Store: vectors, Namespace: namespace,
+		Dimension: config.EmbeddingDimension, TimestampField: "timestamp",
 		Filter: []vectorstore.Query{{Field: "warp_log", Operator: vectorstore.QueryOperatorEqual, Value: true}},
 	}}
 }
