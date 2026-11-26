@@ -4031,9 +4031,19 @@ ComplexitySuggestionRunEstimate:
 
 ModelRouter:
   type: object
-  description: A model router - an id, a name and a description beside the same settings as ComplexityAnalyzerConfig, sent and returned at the top level; its phrase suggestions, which only model routers make; the model each tier gets; and the routing that decides which requests it takes. Routers are separate from the complexity analyzer config, which routing rules read complexity_tier from. The cross-field rules of ComplexityAnalyzerConfig apply, and the suggestion rules below.
+  description: A model router - an id, a name, a description and a mode; its targets; and the routing that decides which requests it takes. A classifier router carries the same settings as ComplexityAnalyzerConfig, sent and returned at the top level, with its phrase suggestions, which only model routers make, and has a target list per tier. A conditional router classifies nothing - it sends every request its routing takes to one of its targets, which name no tier, and any classifier setting sent for it is dropped. Routers are separate from the complexity analyzer config, which routing rules read complexity_tier from. For a classifier router the cross-field rules of ComplexityAnalyzerConfig apply, and the suggestion rules below.
   additionalProperties: false
   allOf:
+    # A classifier router needs its phrases; a conditional router has none.
+    - if:
+        not:
+          required: [mode]
+          properties:
+            mode:
+              const: conditional
+      then:
+        required:
+          - keywords
     - if:
         not:
           required: [classifier]
@@ -4114,22 +4124,30 @@ ModelRouter:
           - llm
   required:
     - name
-    - keywords
   properties:
     id:
       type: string
-      maxLength: 64
-      pattern: '^[A-Za-z0-9_-]+$'
+      minLength: 1
+      maxLength: 255
       not:
         const: defaults
-      description: Stable router id; generated when omitted on create. `defaults` is reserved, since it names the endpoint that serves a new router's defaults.
+      description: Stable router id - any text of up to 255 characters, as a routing rule's id is; generated when omitted on create. Percent-encode it in a path. `defaults` is reserved, since it names the endpoint that serves a new router's defaults.
     name:
       type: string
       minLength: 1
       maxLength: 255
-      description: Display name, unique across routers.
+      description: Display name. A name another router in the same scope already has is refused with 409, on create and on rename; routers in different scopes may share one.
     description:
       type: string
+    mode:
+      type: string
+      enum: [classifier, conditional]
+      default: classifier
+      description: How the router routes. classifier classifies each request it takes as SIMPLE, MEDIUM or COMPLEX and applies its target for that tier. conditional classifies nothing and applies one of its targets, which name no tier. Set on create; an update does not change it.
+    origin_rule_id:
+      type: string
+      maxLength: 255
+      description: The id of the routing rule the router was made from, when it was. Chained routers made from one routing rule fire once between them in a request. Set on create; an update does not change it.
     tier_boundaries:
       $ref: '#/ComplexityTierBoundaries'
     keywords:
@@ -4152,7 +4170,7 @@ ModelRouter:
     targets:
       type: array
       readOnly: true
-      description: The model each tier gets. Returned with the router; set with PUT /api/routing/model-routers/{router_id}/targets. Ignored in a create or update body.
+      description: A classifier router's model for each tier, or a conditional router's targets. Returned with the router; set with PUT /api/routing/model-routers/{router_id}/targets. Ignored in a create or update body.
       items:
         $ref: '#/ModelRouterTarget'
     routing:
@@ -4162,7 +4180,7 @@ ModelRouter:
 
 ModelRouterUpdate:
   type: object
-  description: A change to a model router. Only what the body sends changes - an omitted name or description keeps the stored one, and a body without any classifier setting keeps the stored config; a body with classifier settings replaces the whole config, under the same cross-field rules as ModelRouter. Targets and routing are ignored; each is set on its own endpoint.
+  description: A change to a model router. Only what the body sends changes - an omitted name or description keeps the stored one, and a body without any classifier setting keeps the stored config; a body with classifier settings replaces the whole config, under the same cross-field rules as ModelRouter. A conditional router has no classifier settings, so any sent are dropped. A new name another router in the same scope already has is refused with 409. Targets and routing are ignored; each is set on its own endpoint. The mode and origin are set when the router is created and are not changed.
   additionalProperties: false
   allOf:
     - if:
@@ -4265,7 +4283,7 @@ ModelRouterUpdate:
       type: string
       minLength: 1
       maxLength: 255
-      description: Display name, unique across routers.
+      description: Display name. A new name another router in the same scope already has is refused with 409.
     description:
       type: string
     tier_boundaries:
@@ -4310,22 +4328,10 @@ ModelRouterList:
 
 ModelRouterTarget:
   type: object
-  description: One model for one tier of a model router. Omitting provider or model keeps the request's value, but a target sets at least one.
+  description: One target of a model router - one model for one tier of a classifier router, or one of a conditional router's targets. Omitting provider or model keeps the request's value, and a target that names neither keeps both while still applying its key, fallbacks and first-token deadline.
   additionalProperties: false
   required:
-    - tier
     - weight
-  anyOf:
-    - required: [provider]
-      properties:
-        provider:
-          type: string
-          minLength: 1
-    - required: [model]
-      properties:
-        model:
-          type: string
-          minLength: 1
   dependentRequired:
     key_id:
       - provider
@@ -4333,6 +4339,7 @@ ModelRouterTarget:
     tier:
       type: string
       enum: [SIMPLE, MEDIUM, COMPLEX]
+      description: The tier the target serves. Required for a classifier router's targets; a conditional router's targets name none.
     provider:
       type: [string, 'null']
       description: Target provider (omit to keep the request's provider). Moving to another provider clears a key the routing rules pinned.
@@ -4346,7 +4353,12 @@ ModelRouterTarget:
       type: number
       format: double
       exclusiveMinimum: 0
-      description: Probability weight within the tier; the weights of a tier sum to 1.
+      description: Probability weight within the tier, or across a conditional router's targets; the weights of a tier, or of a conditional router, sum to 1.
+    ttft_timeout_ms:
+      type: [integer, 'null']
+      minimum: 0
+      maximum: 300000
+      description: Time-to-first-token deadline in milliseconds for streaming requests routed to this target, as on a routing rule's target. It takes effect only when the request has fallbacks. Omit it or send 0 for no deadline.
     fallbacks:
       type: array
       description: Fallback chain used when this target is chosen. A non-empty list replaces the request's chain; omit it or send [] to keep the chain the routing rules set.
@@ -4355,7 +4367,7 @@ ModelRouterTarget:
 
 ModelRouterTargetsRequest:
   type: object
-  description: The targets that replace a model router's. Weights within a tier sum to 1; an empty list clears them.
+  description: The targets that replace a model router's. A classifier router's targets each name a tier and a conditional router's name none (400 otherwise). Weights within a tier, or across a conditional router's targets, sum to 1; an empty list clears them.
   additionalProperties: false
   required:
     - targets
@@ -4367,7 +4379,7 @@ ModelRouterTargetsRequest:
 
 ModelRouterRouting:
   type: object
-  description: Which requests a model router takes. Routers are tried after the routing rules, on the request as the routing rules left it - narrowest scope first (virtual key, user, team, customer, global), by priority within a scope - and the first enabled router whose condition holds classifies the request. No other router is tried.
+  description: Which requests a model router takes, and what happens once it has. Routers are tried after the routing rules, on the request as the routing rules left it - narrowest scope first (virtual key, user, team, customer, global), by priority within a scope. An enabled router whose condition holds takes the request - a conditional router applies one of its targets, and a classifier router classifies the request and applies its target for that tier. A router that applies a target ends the walk unless chain is set. A conditional router with no target passes the request to the next router; a classifier router with no target for the request follows empty_target.
   additionalProperties: false
   allOf:
     - if:
@@ -4406,6 +4418,15 @@ ModelRouterRouting:
       minimum: 0
       default: 0
       description: Order within the scope; lower is tried first. Unique within the same scope and scope_id among model routers, separate from routing rule priorities; a duplicate returns 409.
+    chain:
+      type: boolean
+      default: false
+      description: Walk the routers again, from the top, on the provider and model this router chose, as a routing rule with chain_rule re-enters the rules. A chained router fires once in a request, the walk repeats at most routing_chain_max_depth times, and only the last router's key, fallbacks and first-token deadline are applied. Omitted from a response when false.
+    empty_target:
+      type: string
+      enum: [next_router, original_model]
+      default: original_model
+      description: Classifier routers only - where a request goes when the router has no target for it, because it produced no tier or the tier has no target. next_router passes the request to the next router. original_model keeps the request's provider and model and ends the walk. Omitted from a response when original_model.
 
 ModelRouterRoutingUpdate:
   type: object
@@ -4432,6 +4453,13 @@ ModelRouterRoutingUpdate:
       type: integer
       minimum: 0
       description: Order within the scope; lower is tried first. A priority another router in the same scope holds returns 409.
+    chain:
+      type: boolean
+      description: Whether the routers are walked again on what this router chose.
+    empty_target:
+      type: string
+      enum: [next_router, original_model]
+      description: Classifier routers only - where a request goes when the router has no target for it.
 
 ModelRouterDefaults:
   type: object

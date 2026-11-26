@@ -1158,6 +1158,40 @@ test("routing-wiring: a trail check resolves run variables in the lines it expec
   assert.throws(() => new Function("pm", probe)(pm), /should not contain/, "an absent line naming {{run_id}} was not resolved before the check");
 });
 
+// Every model router a scenario creates is deleted in its teardown, before the providers its
+// targets name, and a step that fails jumps to the first of those deletes. A router left behind
+// would hold its priority in the global scope, and the next scenario's create would be refused.
+test("routing-wiring: every model router a scenario creates is deleted in its teardown", () => {
+  const routersPath = (item) => item.request.url.path.slice(0, 3).join("/") === "api/routing/model-routers";
+  let scenarios = 0;
+  for (const folder of routingWiring.item) {
+    if (!Array.isArray(folder.item)) continue;
+    const steps = folder.item.filter((item) => !item.item);
+    // A create whose test accepts 200 or 201 is one the scenario expects to store a router; a
+    // create the API is expected to refuse stores nothing and needs no delete.
+    const created = steps
+      .filter((item) => item.request.method === "POST" && routersPath(item) && item.request.url.path.length === 3)
+      .filter((item) => listenScript(item, "test").includes("var acceptable = [200,201];"))
+      .map((item) => JSON.parse(item.request.body.raw).id);
+    if (created.length === 0) continue;
+    scenarios++;
+    const cleanup = (folder.item.find((item) => item.name === "Cleanup") || {}).item || [];
+    const deleted = cleanup
+      .filter((item) => item.request.method === "DELETE" && routersPath(item))
+      .map((item) => item.request.url.path[3]);
+    assert.deepStrictEqual(deleted, created, `${folder.name}: the teardown deletes other routers than the scenario created`);
+    const firstRouterDelete = cleanup.findIndex((item) => routersPath(item));
+    const firstProviderDelete = cleanup.findIndex((item) => item.request.url.path.slice(0, 2).join("/") === "api/providers");
+    assert.ok(firstProviderDelete < 0 || firstRouterDelete < firstProviderDelete, `${folder.name}: a provider is deleted before the routers that name it`);
+    for (const item of steps) {
+      const src = listenScript(item, "test");
+      if (!src.includes("var cleanupReq = ")) continue;
+      assert.ok(src.includes(`var cleanupReq = ${JSON.stringify(cleanup[0].name)};`), `${folder.name} / ${item.name} does not jump to the first teardown step on failure`);
+    }
+  }
+  assert.ok(scenarios >= 6, `only ${scenarios} scenarios create a model router`);
+});
+
 // Execute the collection's own folder scripts, not a copied implementation.
 const registrationFolder = JSON.parse(readFileSync(join(here, "provider-harness.json"), "utf8")).item.find(
   (item) => item.name === "378. Management-created provider prefixes route immediately (provider-prefix-registration)",

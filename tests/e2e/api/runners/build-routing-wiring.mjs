@@ -391,7 +391,13 @@ function expandScenario(sc) {
   const hasVkScenario = sc.steps.some((s) => s.type === "createVK");
   const hasRuleScenario = sc.steps.some((s) => s.type === "createRule");
   const cleanupRule = `cleanup: delete routing rule [${sid}]`;
-  const cleanupTarget = hasRuleScenario ? cleanupRule : hasVkScenario ? cleanupVk : cleanupProvider;
+  // A scenario may create several model routers, each under its own ref ("r1", "r2"). A router's id
+  // and name are the same run-scoped string, and every router created is deleted in the teardown,
+  // before the virtual key and the providers its targets name.
+  const routerRefs = [...new Set(sc.steps.filter((s) => s.type === "createRouter").map((s) => s.ref || "r1"))];
+  const routerIdSeg = (ref) => `catwiring-rtr-${sid}-${ref || "r1"}-{{run_id}}`;
+  const cleanupRouter = (ref) => `cleanup: delete model router ${ref} [${sid}]`;
+  const cleanupTarget = hasRuleScenario ? cleanupRule : routerRefs.length ? cleanupRouter(routerRefs[0]) : hasVkScenario ? cleanupVk : cleanupProvider;
   // A scenario may stand up more than one provider (e.g. governance LB across
   // providers). ref "self" is the scenario's primary provider; any other ref
   // gets its own run-scoped name. All created providers are torn down.
@@ -605,6 +611,65 @@ function expandScenario(sc) {
         items.push(item(nextId("create-rule"), name, request("POST", url(["api", "governance", "routing-rules"]), body), events(null, exec)));
         break;
       }
+      case "createRouter": {
+        // A model router in the global scope, on and taking the requests cel holds for. Its condition
+        // should match only this run's own model, so it cannot take another scenario's requests. It
+        // is a conditional router unless the step names a mode; a classifier router's settings come
+        // from step.classifier, a function of the provider names. Targets and their fallbacks name
+        // providers by ref, a classifier router's targets also name a tier, and a target with no
+        // providerRef and no model keeps the request's own. Targets are saved on their own endpoint,
+        // as the dashboard saves them.
+        const ref = step.ref || "r1";
+        const name = uniq(step.label);
+        const routing = { enabled: true, scope: "global", cel_expression: step.cel, priority: step.priority ?? 0 };
+        if (step.chain) routing.chain = true;
+        if (step.emptyTarget) routing.empty_target = step.emptyTarget;
+        const body = {
+          id: routerIdSeg(ref),
+          name: routerIdSeg(ref),
+          mode: step.mode || "conditional",
+          ...(step.classifier ? step.classifier(nameOf) : {}),
+          routing,
+        };
+        items.push(item(nextId("create-router"), name, request("POST", url(["api", "routing", "model-routers"]), body),
+          events(null, mutationTest(name, [200, 201], cleanupTarget))));
+        if (step.targets) {
+          const targets = step.targets.map((tg) => ({
+            ...(tg.tier ? { tier: tg.tier } : {}),
+            ...(tg.providerRef ? { provider: nameOf(tg.providerRef) } : {}),
+            ...(tg.model ? { model: tg.model } : {}),
+            weight: tg.weight ?? 1,
+            ...(tg.fallbacks ? { fallbacks: tg.fallbacks.map((f) => `${nameOf(f.providerRef)}/${f.model}`) } : {}),
+          }));
+          const tname = uniq(`set the targets of router ${ref}`);
+          items.push(item(nextId("router-targets"), tname,
+            request("PUT", url(["api", "routing", "model-routers", routerIdSeg(ref), "targets"]), { targets }),
+            events(null, mutationTest(tname, [200], cleanupTarget))));
+        }
+        break;
+      }
+      case "routerApi": {
+        // One management call on the model router API, sent once and judged once: its status and,
+        // for a refusal, a part of its message. With ref it is a call on that router (path names what
+        // follows the id, such as ["routing"] or ["targets"]); without ref it is a call on the
+        // collection, such as a create the API is expected to refuse. body may be a function of the
+        // provider names and the router ids, for a body that names them.
+        const name = uniq(step.label);
+        const path = ["api", "routing", "model-routers", ...(step.ref ? [routerIdSeg(step.ref)] : []), ...(step.path || [])];
+        const body = typeof step.body === "function" ? step.body({ nameOf, routerId: routerIdSeg }) : (step.body ?? null);
+        const lines = [
+          `if (pm.response.code !== ${step.expectStatus}) { throw new Error('expected status ${step.expectStatus} got ' + pm.response.code + ' body ' + pm.response.text()); }`,
+          ...(step.expectErrorSubstr ? [
+            "var body = pm.response.json() || {};",
+            "var msg = (body.error && (body.error.message || body.error)) || body.message || '';",
+            `var expectedSubstr = pm.variables.replaceIn(${JSON.stringify(step.expectErrorSubstr)});`,
+            "if (String(msg).indexOf(expectedSubstr) < 0) { throw new Error('error message=' + msg + ' expected to contain ' + expectedSubstr); }",
+          ] : []),
+        ];
+        items.push(item(nextId("router-api"), name, request(step.method, url(path), body),
+          events(null, singleTest(name, lines, cleanupTarget))));
+        break;
+      }
       case "deleteProvider": {
         const name = uniq(step.label);
         items.push(item(nextId("delete-provider"), name, request("DELETE", url(["api", "providers", nameOf(step.ref)]), null),
@@ -756,6 +821,11 @@ function expandScenario(sc) {
     cleanupItems.push(item(`rt-${sid}-cleanup-rule`, cleanupRule,
       request("DELETE", url(["api", "governance", "routing-rules", `{{ruleid_${sid}}}`]), null),
       events(null, cleanupTest(cleanupRule))));
+  }
+  for (const ref of routerRefs) {
+    cleanupItems.push(item(`rt-${sid}-cleanup-router-${ref}`, cleanupRouter(ref),
+      request("DELETE", url(["api", "routing", "model-routers", routerIdSeg(ref)]), null),
+      events(null, cleanupTest(cleanupRouter(ref)))));
   }
   if (hasVk) {
     cleanupItems.push(item(`rt-${sid}-cleanup-vk`, cleanupVk,
@@ -1331,6 +1401,95 @@ const SCENARIOS = [
       { type: "addProvider", keys: [key({ id: "k1", models: ["*"] })] },
       { type: "createVK", providerConfigs: [] },
       { type: "route", model: MODEL_B, expectStatus: 403, expectErrorType: "provider_blocked", expectErrorSubstr: "is not allowed", label: "deny-by-default refuses the request (403 provider_blocked)" },
+      { type: "cleanup" },
+    ],
+  },
+  {
+    id: "router-conditional-routes",
+    title: "A conditional model router sends the requests its condition takes to its target",
+    description: "Two providers serve this run's own model and the caller names provider A. A conditional model router whose condition is that model moves the request to B without classifying it, and the trail records the router's choice. Turned off, the router takes nothing and A serves again.",
+    steps: [
+      { type: "addProvider", ref: "self", keys: [key({ id: "ka", models: ["catwiring-mr01-{{run_id}}"], aliases: { "catwiring-mr01-{{run_id}}": MODEL_B } })] },
+      { type: "addProvider", ref: "b", keys: [key({ id: "kb", models: ["catwiring-mr01-{{run_id}}"], aliases: { "catwiring-mr01-{{run_id}}": MODEL_B } })] },
+      { type: "route", model: "catwiring-mr01-{{run_id}}", useVk: false, expectStatus: 200, label: "with no router, the provider the caller named serves" },
+      { type: "createRouter", ref: "r1", cel: "model == 'catwiring-mr01-{{run_id}}'", targets: [{ providerRef: "b", model: "catwiring-mr01-{{run_id}}" }], label: "create a conditional router: this run's model goes to B" },
+      { type: "route", model: "catwiring-mr01-{{run_id}}", useVk: false, requestId: true, expectStatus: 200, expectProviderOneOf: ["b"], label: "the router moves the request to B" },
+      { type: "assertRoutingTrail", fromRequest: true, expectSubstrings: ["Model router 'catwiring-rtr-router-conditional-routes-r1-{{run_id}}' → provider=catwiring-rt-router-conditional-routes-b-{{run_id}}, model=catwiring-mr01-{{run_id}}"], expectAbsent: ["Model router 'catwiring-rtr-router-conditional-routes-r1-{{run_id}}' tier="], waitSeconds: 2, label: "trail: the router's choice, made without a tier" },
+      { type: "routerApi", ref: "r1", method: "PUT", path: ["routing"], body: { enabled: false }, expectStatus: 200, label: "turn the router off" },
+      { type: "route", model: "catwiring-mr01-{{run_id}}", useVk: false, expectStatus: 200, label: "with the router off, the provider the caller named serves again" },
+      { type: "cleanup" },
+    ],
+  },
+  {
+    id: "router-no-target-passes-on",
+    title: "A conditional model router with no target passes the request to the next router",
+    description: "Two conditional routers take this run's own model. The first has no target, so it passes the request on, as a routing rule with no target does; the second sends it to B. The trail shows the first router passing the request on and the second choosing.",
+    steps: [
+      { type: "addProvider", ref: "self", keys: [key({ id: "ka", models: ["catwiring-mr02-{{run_id}}"], aliases: { "catwiring-mr02-{{run_id}}": MODEL_B } })] },
+      { type: "addProvider", ref: "b", keys: [key({ id: "kb", models: ["catwiring-mr02-{{run_id}}"], aliases: { "catwiring-mr02-{{run_id}}": MODEL_B } })] },
+      { type: "createRouter", ref: "r1", cel: "model == 'catwiring-mr02-{{run_id}}'", priority: 0, label: "create the first router, with no target" },
+      { type: "createRouter", ref: "r2", cel: "model == 'catwiring-mr02-{{run_id}}'", priority: 1, targets: [{ providerRef: "b", model: "catwiring-mr02-{{run_id}}" }], label: "create the second router: this run's model goes to B" },
+      { type: "route", model: "catwiring-mr02-{{run_id}}", useVk: false, requestId: true, expectStatus: 200, expectProviderOneOf: ["b"], label: "the second router routes the request to B" },
+      { type: "assertRoutingTrail", fromRequest: true, expectSubstrings: ["Model router 'catwiring-rtr-router-no-target-passes-on-r1-{{run_id}}' has no target; trying the next router", "Model router 'catwiring-rtr-router-no-target-passes-on-r2-{{run_id}}' → provider=catwiring-rt-router-no-target-passes-on-b-{{run_id}}, model=catwiring-mr02-{{run_id}}"], waitSeconds: 2, label: "trail: the first router passes the request on, the second chooses" },
+      { type: "cleanup" },
+    ],
+  },
+  {
+    id: "router-chain",
+    title: "A chained model router's choice is walked again by the routers",
+    description: "The first router takes this run's first model, is chained, and changes only the model, to this run's second model. The routers are then walked again on that model, and the second router, which takes only the second model and sits ahead of the first, sends it to B. Neither router reaches B on its own: only B serves the second model.",
+    steps: [
+      { type: "addProvider", ref: "self", keys: [key({ id: "ka", models: ["catwiring-mr03a-{{run_id}}"], aliases: { "catwiring-mr03a-{{run_id}}": MODEL_B } })] },
+      { type: "addProvider", ref: "b", keys: [key({ id: "kb", models: ["catwiring-mr03b-{{run_id}}"], aliases: { "catwiring-mr03b-{{run_id}}": MODEL_B } })] },
+      { type: "createRouter", ref: "r1", cel: "model == 'catwiring-mr03a-{{run_id}}'", priority: 1, chain: true, targets: [{ model: "catwiring-mr03b-{{run_id}}" }], label: "create the chained router: the first model becomes the second" },
+      { type: "createRouter", ref: "r2", cel: "model == 'catwiring-mr03b-{{run_id}}'", priority: 0, targets: [{ providerRef: "b", model: "catwiring-mr03b-{{run_id}}" }], label: "create the second router, ahead of the first: the second model goes to B" },
+      { type: "route", model: "catwiring-mr03a-{{run_id}}", useVk: false, requestId: true, expectStatus: 200, expectProviderOneOf: ["b"], label: "a request for the first model is served by B" },
+      { type: "assertRoutingTrail", fromRequest: true, expectSubstrings: ["model=catwiring-mr03b-{{run_id}} [chain, continuing]", "Chain step 1: re-evaluating with provider=catwiring-rt-router-chain-{{run_id}}, model=catwiring-mr03b-{{run_id}}", "Model router 'catwiring-rtr-router-chain-r2-{{run_id}}' → provider=catwiring-rt-router-chain-b-{{run_id}}, model=catwiring-mr03b-{{run_id}}"], waitSeconds: 2, label: "trail: the chained choice, the second pass and the second router's choice" },
+      { type: "cleanup" },
+    ],
+  },
+  {
+    id: "router-keeps-model-adds-fallbacks",
+    title: "A model router target that names no provider or model keeps the request's and adds its fallbacks",
+    description: "Provider A's key is one OpenAI refuses. A conditional router takes this run's own model with a target that names neither a provider nor a model, only a fallback to B. The request stays on A, fails there, and B serves it as the router's fallback.",
+    steps: [
+      { type: "addProvider", ref: "self", keys: [key({ id: "kbad", models: ["catwiring-mr04-{{run_id}}"], aliases: { "catwiring-mr04-{{run_id}}": MODEL_B }, badKey: true })] },
+      { type: "addProvider", ref: "b", keys: [key({ id: "kb", models: ["catwiring-mr04-{{run_id}}"], aliases: { "catwiring-mr04-{{run_id}}": MODEL_B } })] },
+      { type: "createRouter", ref: "r1", cel: "model == 'catwiring-mr04-{{run_id}}'", targets: [{ fallbacks: [{ providerRef: "b", model: "catwiring-mr04-{{run_id}}" }] }], label: "create the router: keep the request's provider and model, fall back to B" },
+      { type: "route", model: "catwiring-mr04-{{run_id}}", useVk: false, requestId: true, expectStatus: 200, expectProviderOneOf: ["b"], expectIsFallback: true, expectPrimaryProviderRef: "self", label: "A fails; B serves as the router's fallback" },
+      { type: "assertRoutingTrail", fromRequest: true, expectSubstrings: ["Model router 'catwiring-rtr-router-keeps-model-adds-fallbacks-r1-{{run_id}}' → provider=catwiring-rt-router-keeps-model-adds-fallbacks-{{run_id}}, model=catwiring-mr04-{{run_id}}"], waitSeconds: 2, label: "trail: the router kept the provider the caller named" },
+      { type: "assertFallbackRow", providerRef: "b", fallbackIndex: 1, expectStatus: "success", waitSeconds: 0, label: "B served as fallback 1" },
+      { type: "cleanup" },
+    ],
+  },
+  {
+    id: "router-empty-target",
+    title: "A classifier model router with no target for a request follows empty_target",
+    description: "A classifier router takes this run's own model and has no targets, so it has no target for any tier. With empty_target next_router it passes the request to the next router, a conditional one that sends it to B. With empty_target original_model, the default, it keeps the request and A, the provider the caller named, serves. The route is the same whether or not the classifier produces a tier, so the scenario does not depend on what the classifier answers. An unknown empty_target is refused.",
+    steps: [
+      { type: "addProvider", ref: "self", keys: [key({ id: "ka", models: ["catwiring-mr05-{{run_id}}", MODEL_B], aliases: { "catwiring-mr05-{{run_id}}": MODEL_B } })] },
+      { type: "addProvider", ref: "b", keys: [key({ id: "kb", models: ["catwiring-mr05-{{run_id}}"], aliases: { "catwiring-mr05-{{run_id}}": MODEL_B } })] },
+      { type: "createRouter", ref: "r1", mode: "classifier", classifier: (nameOf) => ({ classifier: "llm", llm: { provider: nameOf("self"), model: MODEL_B }, keywords: { simple_keywords: ["what time is it"], medium_keywords: ["summarise this paragraph"], complex_keywords: ["design a distributed cache"] } }), cel: "model == 'catwiring-mr05-{{run_id}}'", priority: 0, emptyTarget: "next_router", label: "create a classifier router with no targets and empty_target next_router" },
+      { type: "createRouter", ref: "r2", cel: "model == 'catwiring-mr05-{{run_id}}'", priority: 1, targets: [{ providerRef: "b", model: "catwiring-mr05-{{run_id}}" }], label: "create a conditional router after it: this run's model goes to B" },
+      { type: "route", model: "catwiring-mr05-{{run_id}}", useVk: false, requestId: true, expectStatus: 200, expectProviderOneOf: ["b"], label: "next_router: the request reaches the second router and B serves" },
+      { type: "assertRoutingTrail", fromRequest: true, expectSubstrings: ["Model router 'catwiring-rtr-router-empty-target-r1-{{run_id}}'", "; trying the next router", "Model router 'catwiring-rtr-router-empty-target-r2-{{run_id}}' → provider=catwiring-rt-router-empty-target-b-{{run_id}}"], waitSeconds: 2, label: "trail: the classifier router passes the request on" },
+      { type: "routerApi", ref: "r1", method: "PUT", path: ["routing"], body: { empty_target: "original_model" }, expectStatus: 200, label: "set empty_target to original_model" },
+      { type: "route", model: "catwiring-mr05-{{run_id}}", useVk: false, requestId: true, expectStatus: 200, label: "original_model: the classifier router keeps the request and A serves" },
+      { type: "assertRoutingTrail", fromRequest: true, expectSubstrings: ["; keeping provider=catwiring-rt-router-empty-target-{{run_id}}, model=catwiring-mr05-{{run_id}}"], expectAbsent: ["Model router 'catwiring-rtr-router-empty-target-r2-{{run_id}}'"], waitSeconds: 2, label: "trail: the classifier router keeps the request and the second router is not asked" },
+      { type: "routerApi", ref: "r1", method: "PUT", path: ["routing"], body: { empty_target: "skip" }, expectStatus: 400, expectErrorSubstr: "invalid empty_target \"skip\": must be one of: next_router, original_model", label: "an unknown empty_target is refused (400)" },
+      { type: "cleanup" },
+    ],
+  },
+  {
+    id: "router-api-refusals",
+    title: "The model router API refuses a tier on a conditional router, a name taken in its scope and an unknown mode",
+    description: "A conditional router's targets name no tier, so a target with one is refused. A name another router in the same scope already has is refused on create, since names are kept apart within a scope. An unknown mode is refused, and a conditional router has no classifier to reset. Each refusal is a 400 or a 409 with a message that says what to fix.",
+    steps: [
+      { type: "createRouter", ref: "r1", cel: "model == 'catwiring-mr06-{{run_id}}'", label: "create a conditional router" },
+      { type: "routerApi", ref: "r1", method: "PUT", path: ["targets"], body: { targets: [{ tier: "SIMPLE", model: "catwiring-mr06-{{run_id}}", weight: 1 }] }, expectStatus: 400, expectErrorSubstr: "a conditional router's targets take no tier", label: "a tier on a conditional router's target is refused (400)" },
+      { type: "routerApi", method: "POST", body: ({ routerId }) => ({ id: "catwiring-rtr-router-api-refusals-dup-{{run_id}}", name: routerId("r1"), mode: "conditional" }), expectStatus: 409, expectErrorSubstr: "a model router named \"catwiring-rtr-router-api-refusals-r1-{{run_id}}\" already exists in this scope", label: "a name another global router has is refused (409)" },
+      { type: "routerApi", method: "POST", body: { id: "catwiring-rtr-router-api-refusals-mode-{{run_id}}", name: "catwiring-rtr-router-api-refusals-mode-{{run_id}}", mode: "weighted" }, expectStatus: 400, expectErrorSubstr: "invalid mode \"weighted\": must be one of: classifier, conditional", label: "an unknown mode is refused (400)" },
+      { type: "routerApi", ref: "r1", method: "POST", path: ["reset"], expectStatus: 400, expectErrorSubstr: "is a conditional router and has no classifier to reset", label: "a conditional router has no classifier to reset (400)" },
       { type: "cleanup" },
     ],
   },
