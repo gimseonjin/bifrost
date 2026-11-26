@@ -1,0 +1,12 @@
+---
+title: "v2.1.51"
+description: "Helm v2.1.51 changelog - 2026-11-26"
+---
+
+<Update label="Bifrost Helm" description="v2.1.51">
+
+## Changelog
+
+- Added `bifrost.scim.config.minSessionDuration` (default `30m`, every SSO provider), which renders into `scim_config.config.minSessionDuration`. It is the shortest time a sign-in stays trusted before Bifrost re-checks it with the IdP: whole days or h/m/s pairs (`30m`, `8h`, `1d`), between 5m and 7d. It applies with SCIM on or off.
+
+</Update>
